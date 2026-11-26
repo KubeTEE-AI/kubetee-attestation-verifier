@@ -86,7 +86,33 @@ Verify it yourself:
 ```bash
 curl -sS https://raw.githubusercontent.com/virtee/sev/feaf142/Cargo.toml | grep '^version'
 curl -sSL https://crates.io/api/v1/crates/sev/9.0.0/download | sha256sum
+# cargo stamps the source commit into the package; want sha1 == feaf142…:
+curl -sSL https://crates.io/api/v1/crates/sev/9.0.0/download | tar xzO \
+  sev-9.0.0/.cargo_vcs_info.json
 ```
+
+**Audit record (2026-11-26).** Verified the crates.io artifact binds to the
+public commit and is clean:
+
+* `sev-9.0.0.crate` sha256 == the `Cargo.lock` checksum above.
+* `diff -r sev-9.0.0/src <feaf142>/src` → **byte-identical** (the
+  security-bearing code); `Cargo.toml.orig` identical to the tree's `Cargo.toml`.
+* `.cargo_vcs_info.json` → `"sha1": "feaf142…"`, `dirty` absent (packaged from
+  the committed tree, not a modified one).
+* **Crate owners:** `tylerfanelli`, `larrydewey` (AMD/virtee maintainers) +
+  `github:virtee:owners`. **Published 9.0.0** on 2026-11-13 by
+  `DGonzalezVillal` — the author of commit `feaf142` itself.
+* **`v.8.0.0` → `9.0.0` code audit:** the only changed `src/` files are
+  `firmware/**` + `lib.rs` (Venice/V6 extended-TCB parsing + CPUID
+  model-range fix). `src/certs/**` (where ECDSA P-384 + ARK→ASK→VCEK chain
+  verification live) is **unchanged**. Malicious-pattern scan of the whole
+  delta (`unsafe`, `transmute`, `from_raw`, `Command`/`exec`, `asm!`,
+  `TcpStream`/`connect`/`socket`, `include_bytes!`, `set_var`, `/etc/`,
+  `passwd`) → **0 hits**. The only network call (AMD KDS `cek/id` fetch in
+  `util/cached_chain.rs`, reqwest) is `sev`-optional and **compiled out of
+  this crate** — `sev` pulls zero network deps here (verified in `Cargo.lock`).
+* The missing git tag is tracked upstream as
+  [virtee/sev#423](https://github.com/virtee/sev/issues/423).
 
 Dependency policy: `use-latest-library-versions.mdc` — every dep is pinned
 exactly to the latest stable upstream release, re-checked on every manifest

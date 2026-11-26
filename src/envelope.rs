@@ -259,18 +259,8 @@ fn parse_keyset(node: &serde_json::Value, field: &'static str) -> Result<Vec<Key
     Ok(out)
 }
 
-pub fn parse_envelope(doc: &str) -> Result<Envelope, ParseError> {
-    let v: serde_json::Value = serde_json::from_str(doc)?;
-
-    let snp_node = v
-        .get("evidence")
-        .and_then(|e| e.get("snp"))
-        .ok_or(ParseError::Missing("evidence.snp"))?;
-    let report = snp_node
-        .get("attestation_report")
-        .ok_or(ParseError::Missing("evidence.snp.attestation_report"))?;
-
-    let snp = SnpReport {
+pub fn parse_snp_report(report: &serde_json::Value) -> Result<SnpReport, ParseError> {
+    Ok(SnpReport {
         version: report.get("version").and_then(|x| x.as_u64()).ok_or(ParseError::Missing("version"))? as u32,
         guest_svn: report.get("guest_svn").and_then(|x| x.as_u64()).ok_or(ParseError::Missing("guest_svn"))? as u32,
         policy: report.get("policy").and_then(|x| x.as_u64()).ok_or(ParseError::Missing("policy"))?,
@@ -310,7 +300,21 @@ pub fn parse_envelope(doc: &str) -> Result<Envelope, ParseError> {
             let sig = report.get("signature").ok_or(ParseError::Missing("signature"))?;
             bytes_field(sig, "s")?
         },
-    };
+    })
+}
+
+pub fn parse_envelope(doc: &str) -> Result<Envelope, ParseError> {
+    let v: serde_json::Value = serde_json::from_str(doc)?;
+
+    let snp_node = v
+        .get("evidence")
+        .and_then(|e| e.get("snp"))
+        .ok_or(ParseError::Missing("evidence.snp"))?;
+    let report = snp_node
+        .get("attestation_report")
+        .ok_or(ParseError::Missing("evidence.snp.attestation_report"))?;
+
+    let snp = parse_snp_report(report)?;
 
     let keyset_node = v.get("keyset").ok_or(ParseError::Missing("keyset"))?;
     let keyset = Keyset {

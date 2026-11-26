@@ -131,12 +131,22 @@ pub fn verify_snp(
     Ok(())
 }
 
+/// The FULL raw report bytes exactly as AMD encodes them (`sev::to_bytes`,
+/// `ATT_REP_FW_LEN` = 1184 bytes). This is the byte-level ground truth a
+/// verifier checks the signature over (`[..0x2a0]`) and the exact blob the
+/// gateway should serve as `raw_report`. Reuses `sev`'s encoder — never
+/// hand-assembled (the `to_bytes` layout is the known footgun).
+pub fn report_bytes(r: &SnpReport) -> Result<Vec<u8>, SnpError> {
+    let report = to_report(r)?;
+    sev::parser::ByteParser::to_bytes(&report)
+        .map(|b| b.to_vec())
+        .map_err(|e| SnpError::Sev(format!("to_bytes: {e}")))
+}
+
 /// Diagnostics helper: recompute the 672-byte signed body (for error output).
 #[allow(dead_code)]
 pub fn signed_body_hex(r: &SnpReport) -> Result<String, SnpError> {
-    let report = to_report(r)?;
-    let bytes = sev::parser::ByteParser::to_bytes(&report)
-        .map_err(|e| SnpError::Sev(format!("to_bytes: {e}")))?;
+    let bytes = report_bytes(r)?;
     Ok(hex::encode(&bytes[..0x2a0]))
 }
 
