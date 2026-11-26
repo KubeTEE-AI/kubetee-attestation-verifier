@@ -39,6 +39,7 @@ fn to_version(v: envelope::Version3) -> Version {
 /// The 3 ETCB fields are Venice/V6-only; `sev`'s encoder zero-fills them
 /// unless `(V6, Venice)`. They are None on our Milan/Genoa/Turin V5 reports,
 /// which is correct.
+#[allow(clippy::field_reassign_with_default)]
 fn to_report(r: &SnpReport) -> Result<AttestationReport, SnpError> {
     if r.sig_algo != 1 {
         return Err(SnpError::Unsupported(format!(
@@ -76,6 +77,7 @@ fn to_report(r: &SnpReport) -> Result<AttestationReport, SnpError> {
     rep.launch_mit_vector = r.launch_mit_vector;
     rep.current_mit_vector = r.current_mit_vector;
     // ETCB (Venice/V6) — left None on V5 Milan/Genoa/Turin.
+    let _ = &mut rep; // report fields assigned below
     rep.signature = sev::certs::snp::ecdsa::Signature::new(r.signature_r, r.signature_s);
     Ok(rep)
 }
@@ -105,12 +107,9 @@ pub fn verify_chain(chain: &Chain) -> Result<(), SnpError> {
 /// with `to_bytes()[..0x2a0]`, SHA-384s it, and checks the ECDSA P-384
 /// signature. A mismatch means the report bytes are not the ones AMD signed —
 /// tampered, or our reconstruction is wrong. Either way: fail closed.
-pub fn verify_report_signature(
-    chain: &Chain,
-    report: &AttestationReport,
-) -> Result<(), SnpError> {
+pub fn verify_report_signature(chain: &Chain, report: &AttestationReport) -> Result<(), SnpError> {
     use sev::certs::snp::Verifiable as _;
-    (&*chain, &*report)
+    (chain, report)
         .verify()
         .map_err(|_| SnpError::SignatureMismatch)?;
     Ok(())
@@ -129,6 +128,65 @@ pub fn verify_snp(
     let report = to_report(r)?;
     verify_report_signature(&chain, &report)?;
     Ok(())
+}
+
+/// Derive (ARK, ASK, VCEK) PEMs **from the envelope's own `cert_chain`**
+/// (self-contained — no AMD KDS needed). The gateway `1.110.2-kubetee.6`
+/// cert_chain is `[VCEK, ASK, ARK]`. Fail closed if any leg is absent or
+/// unparseable: an empty / partial chain is NOT a pass (it is exactly the
+/// pre-`.6` gap this verifier must not paper over).
+pub fn chain_from_envelope(
+    cert_chain: &[crate::envelope::CertEntry],
+) -> Result<(String, String, String), SnpError> {
+    let mut vcek = String::new();
+    let mut ask = String::new();
+    let mut ark = String::new();
+    let mut vcek_n = 0;
+    let mut ask_n = 0;
+    let mut ark_n = 0;
+    for e in cert_chain {
+        let t = e.cert_type.trim().to_ascii_uppercase();
+        match t.as_str() {
+            "VCEK" => {
+                vcek = e.pem();
+                vcek_n += 1;
+            }
+            "ASK" => {
+                ask = e.pem();
+                ask_n += 1;
+            }
+            "ARK" => {
+                ark = e.pem();
+                ark_n += 1;
+            }
+            _ => {}
+        }
+    }
+    // Legacy entries carry no cert_type — fall back to leaf-to-root order
+    // (the gateway serves VCEK, ASK, ARK).
+    if vcek_n == 0 && ask_n == 0 && ark_n == 0 && cert_chain.len() == 3 {
+        vcek = cert_chain[0].pem();
+        ask = cert_chain[1].pem();
+        ark = cert_chain[2].pem();
+    }
+    if vcek.is_empty() || ask.is_empty() || ark.is_empty() {
+        return Err(SnpError::Cert(format!(
+            "envelope cert_chain is not a complete VCEK/ASK/ARK (VCEK:{vcek_n} ASK:{ask_n} ARK:{ark_n}, {} entries)",
+            cert_chain.len()
+        )));
+    }
+    Ok((ark, ask, vcek))
+}
+
+/// Verify the SNP report **self-contained**: chain + signature derived from the
+/// envelope's own `cert_chain`. This is the offline / no-KDS path — the
+/// evidence self-authenticates against AMD's root of trust.
+pub fn verify_snp_from_chain(
+    r: &SnpReport,
+    cert_chain: &[crate::envelope::CertEntry],
+) -> Result<(), SnpError> {
+    let (ark, ask, vcek) = chain_from_envelope(cert_chain)?;
+    verify_snp(r, &ark, &ask, &vcek)
 }
 
 /// The FULL raw report bytes exactly as AMD encodes them (`sev::to_bytes`,

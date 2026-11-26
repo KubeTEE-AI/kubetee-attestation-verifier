@@ -74,7 +74,10 @@ fn live_chain_verifies() {
 fn live_binding_verifies() {
     let env = live_envelope();
     let digest = kv::verify_binding(&env).expect("live binding verifies");
-    assert_eq!(digest, "sha256:3a6615110163ab6c6e011057d51050738892313c697b186a7137c67c9018f0a8");
+    assert_eq!(
+        digest,
+        "sha256:3a6615110163ab6c6e011057d51050738892313c697b186a7137c67c9018f0a8"
+    );
 }
 
 /// The signed SNP reference (launch_measurement + host_data + report_version).
@@ -90,7 +93,7 @@ fn live_report_matches_signed_reference() {
 /// TLS possession + SPKI pin against the live leaf.
 #[test]
 fn live_tls_possession_verifies() {
-    use base64::{engine::general_purpose::STANDARD, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD};
     let env = live_envelope();
     let der = STANDARD.decode(LIVE_TLS_LEAF_DER_B64.trim()).unwrap();
     let leaf = x509_cert::Certificate::from_der(&der).unwrap();
@@ -102,7 +105,10 @@ fn live_tls_possession_verifies() {
 fn tampered_nonce_fails_binding() {
     let mut env = live_envelope();
     env.nonce = "ff".repeat(32);
-    assert!(kv::verify_binding(&env).is_err(), "tampered nonce must FAIL binding");
+    assert!(
+        kv::verify_binding(&env).is_err(),
+        "tampered nonce must FAIL binding"
+    );
 }
 
 /// FAIL-CLOSED: a tampered keyset digest must not verify.
@@ -110,7 +116,10 @@ fn tampered_nonce_fails_binding() {
 fn tampered_keyset_digest_fails_binding() {
     let mut env = live_envelope();
     env.bindings.keyset_digest = "sha256:".to_string() + &"0".repeat(64);
-    assert!(kv::verify_binding(&env).is_err(), "tampered keyset_digest must FAIL");
+    assert!(
+        kv::verify_binding(&env).is_err(),
+        "tampered keyset_digest must FAIL"
+    );
 }
 
 /// FAIL-CLOSED: a tampered report field must fail the signature check.
@@ -130,7 +139,10 @@ fn tampered_host_data_fails_reference() {
     let mut r = live_report();
     r.host_data[0] ^= 0x01;
     let reference: serde_json::Value = serde_json::from_str(LIVE_REFERENCE).unwrap();
-    assert!(kv::match_snp_reference(&r, &reference).is_err(), "tampered host_data must FAIL reference");
+    assert!(
+        kv::match_snp_reference(&r, &reference).is_err(),
+        "tampered host_data must FAIL reference"
+    );
 }
 
 /// FAIL-CLOSED: an unlisted register set must not match any active record.
@@ -168,7 +180,7 @@ fn tampered_registry_signature_fails() {
 /// FAIL-CLOSED: a wrong TLS SPKI must not verify possession.
 #[test]
 fn wrong_tls_spki_fails_possession() {
-    use base64::{engine::general_purpose::STANDARD, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD};
     let env = live_envelope();
     let der = STANDARD.decode(LIVE_TLS_LEAF_DER_B64.trim()).unwrap();
     let leaf = x509_cert::Certificate::from_der(&der).unwrap();

@@ -35,8 +35,9 @@ enum Cmd {
         /// Pinned measurements signing key (base64url, 32 bytes). Omit to skip sig check.
         #[arg(long)]
         signing_key: Option<String>,
-        /// Fetch ARK/ASK/VCEK from AMD KDS (default). Offline: pass --vcek/--ark/--ask.
-        #[arg(long, default_value_t = true)]
+        /// Fetch ARK/ASK/VCEK from AMD KDS (default). `--kds=false` skips it and
+        /// uses the envelope's own cert_chain (or --ark/--ask/--vcek).
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = true, num_args = 0..=1)]
         kds: bool,
         /// Offline VCEK PEM file (skips KDS).
         #[arg(long)]
@@ -63,11 +64,8 @@ fn main() {
         Cmd::Inspect { evidence } => {
             let env = parse_or_exit(&read(&evidence));
             let r = &env.snp;
-            let product = kv::kds_product(
-                r.cpuid_fam_id.unwrap_or(0),
-                r.cpuid_mod_id.unwrap_or(0),
-            )
-            .unwrap_or("UNKNOWN");
+            let product = kv::kds_product(r.cpuid_fam_id.unwrap_or(0), r.cpuid_mod_id.unwrap_or(0))
+                .unwrap_or("UNKNOWN");
             println!("tee:                {}", env.tee);
             println!("runtime_class:      {}", env.runtime_class);
             println!("pod:                {}", env.pod);
@@ -93,10 +91,7 @@ fn main() {
             println!("host_data:          {}", hex::encode(r.host_data));
             println!("report_data:        {}", hex::encode(r.report_data));
             println!("keyset_digest:      {}", env.bindings.keyset_digest);
-            println!(
-                "statement:          {}",
-                env.bindings.report_data_statement
-            );
+            println!("statement:          {}", env.bindings.report_data_statement);
             match kv::snp::signed_body_hex(r) {
                 Ok(body) => println!("signed body (672B): {body}"),
                 Err(e) => println!("signed body:        <recompute failed: {e}>"),
@@ -116,45 +111,60 @@ fn main() {
         } => {
             let env = parse_or_exit(&read(&evidence));
 
-            // (1) Chain: from AMD KDS or offline PEMs.
-            let (ark_pem, ask_pem, vcek_pem) = if use_kds && vcek.is_none() {
+            // (1) Chain: explicit PEMs > AMD KDS > the envelope's own cert_chain
+            // (self-contained, gateway 1.110.2-kubetee.6). An empty/partial
+            // chain then fails closed inside `verify_snp_from_chain`.
+            let kds_or_explicit: Option<(String, String, String)> = if let Some(vk) = vcek {
+                let ark_p = ark.expect("--ark required with --vcek");
+                let ask_p = ask.expect("--ask required with --vcek");
+                Some((read(&ark_p), read(&ask_p), read(&vk)))
+            } else if use_kds {
                 let product = kv::kds_product(
                     env.snp.cpuid_fam_id.unwrap_or(0),
                     env.snp.cpuid_mod_id.unwrap_or(0),
-                )
-                .unwrap_or_else(|e| {
-                    eprintln!("cannot determine KDS product: {e}");
-                    std::process::exit(2);
-                });
-                match kv::kds::fetch_chain(product, &env.snp.chip_id, env.snp.reported_tcb) {
-                    Ok(c) => (c.ark_pem, c.ask_pem, c.vcek_pem),
-                    Err(e) => {
-                        eprintln!("KDS fetch failed (offline? pass --ark/--ask/--vcek): {e}");
-                        std::process::exit(2);
+                );
+                match product {
+                    Ok(p) => {
+                        match kv::kds::fetch_chain(p, &env.snp.chip_id, env.snp.reported_tcb) {
+                            Ok(c) => Some((c.ark_pem, c.ask_pem, c.vcek_pem)),
+                            Err(e) => {
+                                eprintln!(
+                                    "note: KDS fetch failed ({e}); using the envelope's own cert_chain"
+                                );
+                                None
+                            }
+                        }
                     }
+                    Err(_) => None,
                 }
             } else {
-                (
-                    read(&ark.expect("--ark required with --vcek")),
-                    read(&ask.expect("--ask required with --vcek")),
-                    read(&vcek.expect("--vcek required")),
-                )
+                None
+            };
+            let (ark_pem, ask_pem, vcek_pem) = match &kds_or_explicit {
+                Some((a, s, v)) => (Some(a.as_str()), Some(s.as_str()), Some(v.as_str())),
+                None => (None, None, None),
             };
 
-            let reference_doc = reference.map(|p| read(&p)).and_then(|s| serde_json::from_str(&s).ok());
-            let registry_doc = registry.map(|p| read(&p)).and_then(|s| serde_json::from_str(&s).ok());
-            let tls_leaf_der = tls_leaf.as_ref().and_then(|p| read_leaf(p));
+            let reference_doc = reference
+                .map(|p| read(&p))
+                .and_then(|s| serde_json::from_str(&s).ok());
+            let registry_doc = registry
+                .map(|p| read(&p))
+                .and_then(|s| serde_json::from_str(&s).ok());
+            let tls_leaf_der = tls_leaf.as_ref().and_then(read_leaf);
 
             let input = kv::VerifyInput {
                 envelope: &env,
-                ark_pem: &ark_pem,
-                ask_pem: &ask_pem,
-                vcek_pem: &vcek_pem,
+                ark_pem,
+                ask_pem,
+                vcek_pem,
                 snp_reference: reference_doc.as_ref(),
                 registry: registry_doc.as_ref(),
                 tls_leaf_der: tls_leaf_der.as_deref(),
                 tls_domain: &tls_domain,
-                signing_key_b64url: signing_key.as_deref().or(Some(kv::registry::DEFAULT_SIGNING_KEY_B64URL)),
+                signing_key_b64url: signing_key
+                    .as_deref()
+                    .or(Some(kv::registry::DEFAULT_SIGNING_KEY_B64URL)),
                 now_iso: None,
             };
             let verdict = kv::verify(&input);
@@ -187,7 +197,7 @@ fn read_leaf(path: &PathBuf) -> Option<Vec<u8>> {
 }
 
 fn pem_first_cert_der(pem: &str) -> Option<Vec<u8>> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD};
     let body = pem
         .split("-----BEGIN CERTIFICATE-----")
         .nth(1)?

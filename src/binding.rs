@@ -1,7 +1,7 @@
 //! `kubetee.attestation.v1` request binding + TLS possession proof.
 
-use crate::envelope::{jcs, sha256_hex, Bindings, Envelope, Keyset, TlsPossession};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use crate::envelope::{Bindings, Envelope, Keyset, TlsPossession, jcs, sha256_hex};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256, Sha512};
 
 #[derive(Debug, thiserror::Error)]
@@ -113,12 +113,12 @@ pub fn verify_binding(env: &Envelope) -> Result<String, BindingError> {
         ));
     }
 
-    if let Some(qrd) = env.quote_report_data {
-        if qrd != env.snp.report_data {
-            return Err(BindingError::Mismatch(
-                "quote_report_data != snp.report_data (evidence inconsistent)".to_string(),
-            ));
-        }
+    if let Some(qrd) = env.quote_report_data
+        && qrd != env.snp.report_data
+    {
+        return Err(BindingError::Mismatch(
+            "quote_report_data != snp.report_data (evidence inconsistent)".to_string(),
+        ));
     }
 
     Ok(computed_digest)
@@ -148,9 +148,9 @@ pub fn verify_tls_possession(
         .iter()
         .find(|k| k.domain == tls_domain)
         .map(|k| k.spki_sha256.trim_start_matches("sha256:").to_lowercase())
-        .ok_or_else(|| BindingError::TlsPossession(format!(
-            "keyset names no tls key for domain {tls_domain}"
-        )))?;
+        .ok_or_else(|| {
+            BindingError::TlsPossession(format!("keyset names no tls key for domain {tls_domain}"))
+        })?;
     if spki_sha != expected {
         return Err(BindingError::TlsPossession(format!(
             "TLS SPKI pin mismatch: leaf {spki_sha}, keyset {expected}"
@@ -214,8 +214,8 @@ fn verify_tls_signature(
     match alg {
         "RS256" | "rsa-pkcs1-sha256" => {
             use rsa::pkcs1v15::{Signature, VerifyingKey};
-            use rsa::signature::Verifier;
             use rsa::sha2::Sha256 as RsaSha256;
+            use rsa::signature::Verifier;
             // Parse the RSAPublicKey (SEQUENCE{n, e}) from the SPKI BIT STRING.
             // (x509-cert is on spki 0.8 and rsa 0.9 is on spki 0.7, so the
             // cross-type TryFrom<SubjectPublicKeyInfo> isn't available — decode
@@ -242,7 +242,7 @@ fn verify_tls_signature(
                 .map_err(|_| BindingError::TlsPossession("Ed25519 signature invalid".to_string()))
         }
         "ES256" | "ES384" => {
-            use p384::ecdsa::{signature::Verifier as _, Signature, VerifyingKey};
+            use p384::ecdsa::{Signature, VerifyingKey, signature::Verifier as _};
             // ES256 (P-256) and ES384 (P-384) both verify here via the SPKI's
             // curve; the live gateway is RS256 today. For a non-P-384 key this
             // path rejects (fail closed) rather than silently passing.

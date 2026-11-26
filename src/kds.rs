@@ -38,7 +38,7 @@ pub fn fetch_chain(
     let chain_body = client
         .get(&chain_url)
         .send()
-        .and_then(|r| r.error_for_status().map_err(|e| e))
+        .and_then(|r| r.error_for_status())
         .map_err(|e| match e.status() {
             Some(s) => KdsError::Status {
                 status: s.as_u16(),
@@ -61,7 +61,9 @@ pub fn fetch_chain(
         });
     }
     // KDS serves the VCEK as DER; normalize to PEM for `sev::Certificate`.
-    let vcek_bytes = vcek_resp.bytes().map_err(|e| KdsError::Http(e.to_string()))?;
+    let vcek_bytes = vcek_resp
+        .bytes()
+        .map_err(|e| KdsError::Http(e.to_string()))?;
     let vcek_pem = if vcek_bytes.starts_with(b"-----BEGIN") {
         String::from_utf8_lossy(&vcek_bytes).to_string()
     } else {
@@ -107,7 +109,7 @@ fn split_ask_ark(pem_bundle: &str) -> Option<(String, String)> {
     }
     let wrap = |body: &str| -> String {
         format!(
-            "-----BEGIN CERTIFICATE-----{}-----END CERTIFICATE-----\n",
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
             body.trim()
         )
     };
@@ -131,7 +133,7 @@ fn pem_body_has_ark_marker(_body: &str) -> bool {
 }
 
 fn der_to_pem(der: &[u8]) -> String {
-    use base64::{engine::general_purpose::STANDARD, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD};
     let b64 = STANDARD.encode(der);
     let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
     for (i, c) in b64.chars().enumerate() {

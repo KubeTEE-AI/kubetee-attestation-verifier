@@ -36,6 +36,10 @@ fn main() {
     let bytes = kv::snp::report_bytes(&r).expect("sev::to_bytes");
     let signed = 0x2a0.min(bytes.len());
     eprintln!("report bytes: {}", bytes.len());
-    eprintln!("signed body hex ({} B): {}", signed, hex::encode(&bytes[..signed]));
+    eprintln!(
+        "signed body hex ({} B): {}",
+        signed,
+        hex::encode(&bytes[..signed])
+    );
     println!("{}", hex::encode(&bytes));
 }

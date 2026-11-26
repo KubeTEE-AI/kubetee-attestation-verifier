@@ -13,8 +13,8 @@
 //! `RFC8785-without-signature-member`). The pinned public key is in
 //! `tee-measurements-signing-key-2026.json`; a verifier MUST check it.
 
-use crate::envelope::{jcs, SnpReport};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use crate::envelope::{SnpReport, jcs};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 pub const REGISTRY_SCHEMA: &str = "kubetee.tee-measurements-registry/1";
@@ -94,12 +94,19 @@ pub struct Record {
 /// Parse `records[]` from the registry.
 pub fn registry_records(doc: &serde_json::Value) -> Vec<Record> {
     let empty = Vec::new();
-    let arr = doc.get("records").and_then(|r| r.as_array()).unwrap_or(&empty);
+    let arr = doc
+        .get("records")
+        .and_then(|r| r.as_array())
+        .unwrap_or(&empty);
     arr.iter()
         .filter_map(|r| {
             let obj = r.as_object()?;
             let id = obj.get("id")?.as_str()?.to_string();
-            let tee = obj.get("tee").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let tee = obj
+                .get("tee")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             let status = obj
                 .get("status")
                 .and_then(|x| x.as_str())
@@ -193,15 +200,12 @@ pub fn match_any_active_record(
 /// absent (an SNP backend has no TDX registers).
 pub fn tdx_regs(evidence: &serde_json::Value) -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
-    let body = evidence
-        .get("tdx")
-        .and_then(|t| t.get("regs"))
-        .or_else(|| {
-            evidence
-                .get("claims")
-                .and_then(|c| c.get("quote"))
-                .and_then(|q| q.get("body"))
-        });
+    let body = evidence.get("tdx").and_then(|t| t.get("regs")).or_else(|| {
+        evidence
+            .get("claims")
+            .and_then(|c| c.get("quote"))
+            .and_then(|q| q.get("body"))
+    });
     let Some(body) = body.and_then(|b| b.as_object()) else {
         return out;
     };
@@ -228,7 +232,10 @@ pub fn tdx_regs(evidence: &serde_json::Value) -> std::collections::BTreeMap<Stri
 ///   * `snp.launch_measurement.sha384` (hex) == report `measurement`.
 ///   * `snp.host_data.sha384_uncompressed_initdata_toml_prefix32` == report `host_data`.
 ///   * `snp.report_version` == report `version`.
-pub fn match_snp_reference(report: &SnpReport, reference: &serde_json::Value) -> Result<(), RegistryError> {
+pub fn match_snp_reference(
+    report: &SnpReport,
+    reference: &serde_json::Value,
+) -> Result<(), RegistryError> {
     let snp = reference
         .get("snp")
         .ok_or_else(|| RegistryError::Rejected("reference has no snp member".to_string()))?;
@@ -237,7 +244,9 @@ pub fn match_snp_reference(report: &SnpReport, reference: &serde_json::Value) ->
         .get("launch_measurement")
         .and_then(|l| l.get("sha384"))
         .and_then(|x| x.as_str())
-        .ok_or_else(|| RegistryError::Rejected("reference has no snp.launch_measurement.sha384".to_string()))?
+        .ok_or_else(|| {
+            RegistryError::Rejected("reference has no snp.launch_measurement.sha384".to_string())
+        })?
         .trim_start_matches("sha384:")
         .to_lowercase();
     let got_m = hex::encode(report.measurement);
@@ -251,7 +260,9 @@ pub fn match_snp_reference(report: &SnpReport, reference: &serde_json::Value) ->
         .get("host_data")
         .and_then(|h| h.get("sha384_uncompressed_initdata_toml_prefix32"))
         .and_then(|x| x.as_str())
-        .ok_or_else(|| RegistryError::Rejected("reference has no snp.host_data prefix32".to_string()))?
+        .ok_or_else(|| {
+            RegistryError::Rejected("reference has no snp.host_data prefix32".to_string())
+        })?
         .trim_start_matches("sha384:")
         .to_lowercase();
     let got_hd = hex::encode(report.host_data);
@@ -261,13 +272,13 @@ pub fn match_snp_reference(report: &SnpReport, reference: &serde_json::Value) ->
         )));
     }
 
-    if let Some(rv) = snp.get("report_version").and_then(|x| x.as_u64()) {
-        if rv != u64::from(report.version) {
-            return Err(RegistryError::Rejected(format!(
-                "snp.report_version mismatch: got {}, expected {rv}",
-                report.version
-            )));
-        }
+    if let Some(rv) = snp.get("report_version").and_then(|x| x.as_u64())
+        && rv != u64::from(report.version)
+    {
+        return Err(RegistryError::Rejected(format!(
+            "snp.report_version mismatch: got {}, expected {rv}",
+            report.version
+        )));
     }
     Ok(())
 }

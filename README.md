@@ -38,22 +38,38 @@ curl -sS "https://llm.kubetee.ai/v1/attestation?nonce=$NONCE" > evidence.json
 curl -sS https://kubetee.ai/.well-known/tee-measurements.json > reference.json
 curl -sS https://kubetee.ai/.well-known/tee-measurements-registry.json > registry.json
 
-# 3. Verify (AMD KDS is queried for the VCEK + ARK/ASK automatically):
+# 3. Verify — self-contained: the evidence's own cert_chain (VCEK→ASK→ARK)
+#    is the chain of trust. No AMD KDS needed (gateway 1.110.2-kubetee.6+).
 openssl s_client -connect llm.kubetee.ai:443 -servername llm.kubetee.ai \
   </dev/null 2>/dev/null | openssl x509 -outform DER > tls_leaf.der
 
 kubetee-attestation-verifier verify \
-  --evidence evidence.json \
+  --evidence evidence.json --kds=false \
   --reference reference.json \
-  --registry registry.json \
   --tls-leaf tls_leaf.der \
   --tls-domain llm.kubetee.ai
 ```
 
-Exit code `0` = all checks PASS; `1` = at least one FAIL (each line prefixed
-`PASS ` / `FAIL `); `2` = usage / IO error.
+`--kds=false` verifies **self-contained**: the chain + report signature come
+from the evidence's own `cert_chain` (which the gateway `1.110.2-kubetee.6`
+delivers as `[VCEK, ASK, ARK]`). This is the offline / air-gapped path and the
+one a third party should prefer — it trusts only AMD's root of trust (built
+into `sev`) and the evidence bytes.
 
-Offline (no KDS) — pass the PEMs you already fetched:
+Exit code `0` = all checks PASS; `1` = at least one FAIL (each line prefixed
+`PASS ` / `FAIL ` / `SKIP `); `2` = usage / IO error.
+
+Cross-check with AMD KDS (optional — fetches the VCEK + ARK/ASK and re-verifies;
+omit `--kds=false`):
+
+```bash
+kubetee-attestation-verifier verify \
+  --evidence evidence.json \
+  --reference reference.json \
+  --tls-leaf tls_leaf.der --tls-domain llm.kubetee.ai
+```
+
+Fully offline with PEMs you already trust (skips both the evidence chain and KDS):
 
 ```bash
 kubetee-attestation-verifier verify \
@@ -61,6 +77,11 @@ kubetee-attestation-verifier verify \
   --ark ark.pem --ask ask.pem --vcek vcek.pem \
   --reference reference.json
 ```
+
+`--registry registry.json` matches a **relayed TDX backend**'s registers
+(`evidence.tdx`) against `tee-measurements-registry.json`. On a pure SNP
+gateway envelope (no TDX relay) that check is **skipped** — the SNP
+`reference-measurement` check is the applicable one there.
 
 Diagnostics — see the KDS query + the 672-byte signed body:
 
