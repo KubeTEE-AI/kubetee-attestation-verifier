@@ -221,7 +221,7 @@ fn verify_tls_signature(
             // cross-type TryFrom<SubjectPublicKeyInfo> isn't available — decode
             // the RSAPublicKey DER from the raw BIT STRING via rsa's own pkcs1.)
             use rsa::pkcs1::DecodeRsaPublicKey as _;
-            let rsapk = rsa::RsaPublicKey::from_pkcs1_der(pk_bytes)
+            let rsapk = rsa::PublicKey::from_pkcs1_der(pk_bytes)
                 .map_err(|e| BindingError::TlsPossession(format!("RSA SPKI parse: {e}")))?;
             let vk = VerifyingKey::<RsaSha256>::new(rsapk);
             let sig = Signature::try_from(sig)
