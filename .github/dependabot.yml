@@ -1,0 +1,46 @@
+# Dependabot — keep the Rust dependency graph + Actions pinned tools current.
+#
+# cadence: weekly (Monday, low churn; this is a verification tool — never a
+# silent fast-follow target). Cargo updates open one PR per dependency; review
+# them like code: this verifier is FAIL-CLOSED, so a dependency bump must run
+# `cargo test` (incl. the test-vector suite in tests/) before merge.
+version: 2
+updates:
+  # Rust (Cargo.toml / Cargo.lock)
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "rust"
+    commit-message:
+      prefix: "cargo"
+    # Group noisy patch-level bumps so the reviewer sees one PR for them;
+    # minor/major bumps stay separate for individual scrutiny (crypto crates
+    # especially: sev, ed25519-dalek, rsa, p384, sha2).
+    groups:
+      patch-level:
+        update-types:
+          - "patch"
+    ignore:
+      # sev is the SNP report verifier core — never auto-bump it alongside
+      # others; its crypto_nossl feature contract is load-bearing for the
+      # fail-closed verification path. Bump deliberately, in its own PR.
+      - dependency-name: "sev"
+
+  # GitHub Actions used by workflows (none checked in yet, but covered so any
+  # future CI workflow's actions stay current).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "actions"
