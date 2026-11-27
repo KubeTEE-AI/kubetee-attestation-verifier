@@ -166,6 +166,61 @@ fn v4_tampered_host_data_fails_reference() {
     );
 }
 
+/// The root-of-trust pin: a **forged** ARK (parseable X.509, self-consistent,
+/// but not a known AMD root) must be rejected. This is exactly the attack an
+/// unanchored chain accepts — an adversary-controlled gateway serving its own
+/// ARK->ASK->VCEK to sign a fabricated report. The pin must fail closed before
+/// the chain signatures are even consulted.
+#[test]
+fn a_forged_self_signed_ark_is_rejected() {
+    let mut env = v4_envelope();
+    // Re-label the ASK certificate as the ARK: a real, parseable X.509 cert
+    // that is NOT any built-in AMD root. `build_chain` parses it fine, but the
+    // root pin must reject it as untrusted.
+    let ask_der = env
+        .cert_chain
+        .iter()
+        .find(|c| c.cert_type == "ASK")
+        .expect("ASK present")
+        .der
+        .clone();
+    let ark = env
+        .cert_chain
+        .iter_mut()
+        .find(|c| c.cert_type == "ARK")
+        .expect("ARK present");
+    ark.der = ask_der;
+    let error = kv::verify_snp_from_chain(&env.snp, &env.cert_chain).unwrap_err();
+    assert!(
+        format!("{error}").contains("not a known AMD root"),
+        "forged ARK must be rejected as an untrusted root, got: {error}"
+    );
+}
+
+/// A **known but wrong-generation** root (Milan ARK presented for a Genoa
+/// report) must also be rejected: the pin matches a known root (so it passes),
+/// but the Genoa ASK/VCEK do not chain to the Milan ARK, so chain consistency
+/// fails. Proves both legs (root pin + chain signatures) are enforced.
+#[test]
+fn a_known_but_mismatched_root_is_rejected() {
+    use sev::certs::snp::builtin;
+    let mut env = v4_envelope();
+    let ark = env
+        .cert_chain
+        .iter_mut()
+        .find(|c| c.cert_type == "ARK")
+        .expect("ARK present");
+    // Replace the Genoa ARK with the Milan ARK (a genuine AMD root — passes the
+    // pin — but not the one that signed this Genoa ASK). Convert the built-in
+    // PEM to DER to match the gateway's raw-DER cert_chain entry format.
+    let milan_ark = sev::certs::snp::Certificate::from_pem(builtin::milan::ARK).unwrap();
+    ark.der = milan_ark.to_der().unwrap();
+    assert!(
+        kv::verify_snp_from_chain(&env.snp, &env.cert_chain).is_err(),
+        "a mismatched known root must FAIL (Genoa ASK does not chain to the Milan ARK)"
+    );
+}
+
 /// The live registry signature verifies (frozen served copy).
 #[test]
 fn v4_registry_signature_verifies() {
