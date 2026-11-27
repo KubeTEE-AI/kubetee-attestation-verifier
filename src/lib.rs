@@ -30,13 +30,16 @@ pub mod registry;
 pub mod snp;
 
 pub use binding::{
-    BindingError, keyset_digest, normalize_nonce, report_data_legacy, report_data_statement,
-    report_data_v1, verify_binding, verify_tls_possession,
+    BindingError, KEY_ATTESTATION_TAG, PURPOSE_V2, decode_pkix_pubkey, keyset_digest,
+    normalize_nonce, report_data_legacy, report_data_preimage_v2, report_data_statement,
+    report_data_statement_v2, report_data_v1, report_data_v2, verify_binding,
+    verify_tls_possession,
 };
 pub use envelope::{CertEntry, Envelope, ParseError, SnpReport, parse_envelope};
 pub use registry::{
-    Record, RegistryError, match_any_active_record, match_snp_reference, registry_records,
-    tdx_regs, verify_registry_signature,
+    GENESIS_PREVIOUS, Record, RegistryError, TRANSITION_TAG, content_hash, match_any_active_record,
+    match_snp_reference, registry_records, tdx_regs, transition_hash, verify_chain_links,
+    verify_history, verify_registry_signature,
 };
 pub use snp::{
     SnpError, build_chain, chain_from_envelope, kds_product, verify_chain, verify_report_signature,

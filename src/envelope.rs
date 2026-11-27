@@ -7,7 +7,7 @@
 //! KubeTEE side, kept byte-consistent with
 //! `litellm/tools/kubetee-litellm-overlay/kubetee_attestation.py`.
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{Engine, engine::general_purpose::URL_SAFE, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, thiserror::Error)]
@@ -479,16 +479,43 @@ pub fn parse_envelope(doc: &str) -> Result<Envelope, ParseError> {
         .map(|arr| arr.iter().filter_map(cert_entry).collect())
         .unwrap_or_default();
 
-    let quote_report_data = v
-        .get("evidence")
-        .and_then(|e| e.get("quote_report_data"))
-        .and_then(|q| q.as_str())
-        .and_then(|b64| {
-            let bytes = URL_SAFE_NO_PAD.decode(b64).ok().filter(|b| b.len() == 64)?;
-            let mut out = [0u8; 64];
-            out.copy_from_slice(&bytes);
-            Some(out)
-        });
+    let quote_report_data = {
+        let node = v.get("evidence").and_then(|e| e.get("quote_report_data"));
+        match node {
+            None | Some(serde_json::Value::Null) => None,
+            Some(q) => {
+                // Present-but-malformed must FAIL the parse (fail closed), not
+                // silently drop to `None` and skip the consistency check
+                // (CVE-2026-92702 zero-length-skips-check class). Accept
+                // padded or unpadded base64url; require exactly 64 bytes.
+                let b64 = q.as_str().ok_or(ParseError::Field {
+                    field: "quote_report_data",
+                    why: "not a base64 string".to_string(),
+                })?;
+                // Line-wrapped base64 appears in live captures (embedded JSON
+                // pretty-printers wrap the long value) — strip interior
+                // whitespace, then accept padded/unpadded base64url or
+                // standard base64. Require exactly 64 bytes.
+                let cleaned: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+                let bytes = URL_SAFE_NO_PAD
+                    .decode(cleaned.trim_end_matches('='))
+                    .or_else(|_| URL_SAFE.decode(&cleaned))
+                    .or_else(|_| {
+                        use base64::engine::general_purpose::STANDARD;
+                        STANDARD.decode(&cleaned)
+                    })
+                    .ok()
+                    .filter(|b| b.len() == 64)
+                    .ok_or(ParseError::Field {
+                        field: "quote_report_data",
+                        why: "must decode to exactly 64 bytes".to_string(),
+                    })?;
+                let mut out = [0u8; 64];
+                out.copy_from_slice(&bytes);
+                Some(out)
+            }
+        }
+    };
 
     let evidence_node = v.get("evidence");
     let tdx_evidence = evidence_node

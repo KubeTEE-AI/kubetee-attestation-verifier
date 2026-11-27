@@ -16,6 +16,7 @@
 use crate::envelope::{SnpReport, jcs};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use sha2::{Digest, Sha256};
 
 pub const REGISTRY_SCHEMA: &str = "kubetee.tee-measurements-registry/1";
 pub const REFERENCE_SCHEMA: &str = "kubetee.tee-measurements/2";
@@ -151,6 +152,10 @@ fn is_active(rec: &Record, now_iso: &str) -> bool {
 /// record id. `regs` maps `mrtd|rtmr0..3|mrconfigid` -> hex. A record matches
 /// when every field it declares is present and equal. Records outside their
 /// `valid_until` window are deprecated and skipped (90-day lifecycle).
+///
+/// Fail-closed (CVE-2026-92702 / CVE-2026-100833 class): an empty or `_`-prefixed
+/// expectation is an ERROR (not a silent skip), so a record can never "match"
+/// on zero compared fields. Zero matching records → `Rejected`, never accept.
 pub fn match_any_active_record(
     regs: &std::collections::BTreeMap<String, String>,
     records: &[Record],
@@ -165,11 +170,23 @@ pub fn match_any_active_record(
         let mut compared = 0;
         let mut mismatches = Vec::new();
         for (name, expected) in &rec.measurements {
-            if name.starts_with('_') || expected.is_empty() {
+            if name.starts_with('_') {
+                // Metadata key (capture notes) — not an expectation.
                 continue;
             }
+            if expected.is_empty() {
+                return Err(RegistryError::Rejected(format!(
+                    "record {}: empty expectation for {name} (fail-closed: a blank expectation must not be skipped)",
+                    rec.id
+                )));
+            }
             match regs.get(name) {
-                Some(got) if got == expected => compared += 1,
+                Some(got) if !got.is_empty() && got == expected => compared += 1,
+                Some(got) if got.is_empty() => {
+                    return Err(RegistryError::Rejected(format!(
+                        "observed register {name} is empty (fail-closed: zero-length input must not match)"
+                    )));
+                }
                 Some(got) => {
                     compared += 1;
                     mismatches.push(format!(
@@ -281,6 +298,181 @@ pub fn match_snp_reference(
         )));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// §3.2 registry anti-rollback: signed transition-hash chain (Contrast-style
+// manifest history) + monotonic revision floor.
+//
+// Each published record-set is additionally bound to a `chain` member:
+//     chain.content_hash           = sha256(jcs(doc-without-signature-and-chain))
+//     chain.previous_transition    = the previous doc's `chain.transition_hash`
+//                                    (genesis = 64 zeros)
+//     chain.transition_hash        = sha256("kubetee.registry.transition/1"
+//                                          ‖ framed(content_hash)
+//                                          ‖ framed(previous_transition))
+// The Ed25519 `signature` covers the doc minus `signature` (i.e. INCLUDING
+// `chain`), so an attacker cannot splice a different history onto a signed
+// record-set. A verifier that has ever seen revision N rejects anything with
+// `version < N` and verifies each served revision's chain end-to-end.
+// ---------------------------------------------------------------------------
+
+/// Domain-separation tag for the registry transition hash.
+pub const TRANSITION_TAG: &[u8] = b"kubetee.registry.transition/1";
+
+/// The genesis `previous_transition_hash` (64 hex zeros).
+pub const GENESIS_PREVIOUS: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Compute `chain.content_hash` = `sha256(jcs(doc minus signature and chain))`.
+pub fn content_hash(doc: &serde_json::Value) -> String {
+    let mut unsigned = doc.clone();
+    if let serde_json::Value::Object(ref mut map) = unsigned {
+        map.remove("signature");
+        map.remove("chain");
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(jcs(&unsigned).as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Compute `chain.transition_hash` = `sha256(tag ‖ framed(content_hash) ‖
+/// framed(previous_transition))` (hex, 64 chars).
+pub fn transition_hash(content_hash_hex: &str, previous_transition_hex: &str) -> String {
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(TRANSITION_TAG);
+    for part in [
+        content_hash_hex.as_bytes(),
+        previous_transition_hex.as_bytes(),
+    ] {
+        preimage.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        preimage.extend_from_slice(part);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(&preimage);
+    hex::encode(hasher.finalize())
+}
+
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Verify one document's internal chain (if it carries one) and return its
+/// `(content_hash, transition_hash, previous_transition_hash)`.
+///
+/// Fail-closed: a present-but-malformed `chain` member (missing/blank/wrong
+/// length hash fields, or a transition_hash that doesn't reproduce) is an
+/// error — never silently treated as "no chain" (that would be a downgrade
+/// to the un-chained form, CVE-2026-100833 class).
+pub fn verify_chain_links(
+    doc: &serde_json::Value,
+) -> Result<(String, String, String), RegistryError> {
+    let Some(chain) = doc.get("chain").and_then(|c| c.as_object()) else {
+        return Err(RegistryError::Rejected(
+            "expectation-absent: registry has no chain member (anti-rollback chain required)"
+                .to_string(),
+        ));
+    };
+    let get = |k: &str| -> Result<&str, RegistryError> {
+        chain
+            .get(k)
+            .and_then(|v| v.as_str())
+            .filter(|s| is_hex64(s))
+            .ok_or_else(|| {
+                RegistryError::Rejected(format!("chain.{k} missing or not 64 hex chars"))
+            })
+    };
+    let served_content = get("content_hash")?;
+    let served_prev = get("previous_transition_hash")?;
+    let served_transition = get("transition_hash")?;
+
+    let computed_content = content_hash(doc);
+    if computed_content != served_content {
+        return Err(RegistryError::Rejected(format!(
+            "chain.content_hash mismatch: computed {computed_content}, served {served_content}"
+        )));
+    }
+    let computed_transition = transition_hash(served_content, served_prev);
+    if computed_transition != served_transition {
+        return Err(RegistryError::Rejected(format!(
+            "chain.transition_hash mismatch: computed {computed_transition}, served {served_transition}"
+        )));
+    }
+    Ok((
+        computed_content,
+        served_transition.to_string(),
+        served_prev.to_string(),
+    ))
+}
+
+/// Verify a served history of registry revisions (newest last or first —
+/// ordered internally by `version`), enforcing:
+///   1. Each revision's `chain` links `previous_transition_hash` to the
+///      PREVIOUS revision's `transition_hash` (by ascending `version`),
+///      genesis revision's `previous` == `GENESIS_PREVIOUS`.
+///   2. **Monotonic floor**: if `min_revision` is set (the highest `version`
+///      this verifier has ever accepted), every served revision with a lower
+///      `version` is rejected outright — closing the "serve an old registry
+///      to a revoked-record's verifier" hole.
+///   3. The latest revision's chain terminates the verified run.
+///
+/// Returns the verified latest `(version, transition_hash)`.
+pub fn verify_history(
+    docs: &[&serde_json::Value],
+    min_revision: Option<u64>,
+) -> Result<(u64, String), RegistryError> {
+    if docs.is_empty() {
+        return Err(RegistryError::Rejected(
+            "history-empty: no registry revisions served (fail-closed)".to_string(),
+        ));
+    }
+    let mut keyed: Vec<(u64, &serde_json::Value)> = Vec::with_capacity(docs.len());
+    for d in docs {
+        let v = d
+            .get("version")
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| RegistryError::Rejected("revision missing version".to_string()))?;
+        keyed.push((v, *d));
+    }
+    keyed.sort_by_key(|(v, _)| *v);
+
+    // Monotonic floor: nothing below the verifier's high-water mark.
+    if let Some(min) = min_revision {
+        for (v, _) in &keyed {
+            if *v < min {
+                return Err(RegistryError::Rejected(format!(
+                    "anti-rollback: served revision {v} is below the verifier's accepted floor {min}"
+                )));
+            }
+        }
+    }
+
+    // Genesis check + sequential link check.
+    let (first_version, first_doc) = keyed.first().expect("non-empty");
+    let (_, first_transition, first_prev) = verify_chain_links(first_doc)?;
+    if *first_version == 1 && first_prev != GENESIS_PREVIOUS {
+        return Err(RegistryError::Rejected(
+            "chain.genesis: revision 1 must chain from 64 zeros".to_string(),
+        ));
+    }
+    let mut prev_transition = first_transition;
+    let mut prev_version = *first_version;
+    for (v, d) in keyed.iter().skip(1) {
+        let (_, transition, prev) = verify_chain_links(d)?;
+        if *v == prev_version {
+            return Err(RegistryError::Rejected(format!(
+                "duplicate revision {v} in served history"
+            )));
+        }
+        if prev != prev_transition {
+            return Err(RegistryError::Rejected(format!(
+                "anti-rollback: revision {v} chains from {prev}, but revision {prev_version} transitioned to {prev_transition} (history spliced)"
+            )));
+        }
+        prev_transition = transition;
+        prev_version = *v;
+    }
+    Ok((prev_version, prev_transition))
 }
 
 /// Build the observed-registry `now` in the same `YYYY-MM-DDTHH:MM:SSZ` form

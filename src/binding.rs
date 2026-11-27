@@ -2,7 +2,7 @@
 
 use crate::envelope::{Bindings, Envelope, Keyset, TlsPossession, jcs, sha256_hex};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BindingError {
@@ -17,8 +17,26 @@ pub enum BindingError {
 /// `report_data_input` values the envelope accepts.
 const PURPOSE: &str = "kubetee.attestation.v1";
 
-/// Normalize + validate the caller nonce: 64 lowercase hex chars.
+/// Phase 6 (zero-operator-trust) binding version: the quote binds a
+/// **per-boot in-guest generated evidence key** (`REPORTDATA = H(pubkey ‖
+/// nonce ‖ context)`, `ReportDataForKeyWithContext`-style domain-separated
+/// transcript). The KBS-released identity key is retired from the serving
+/// path.
+pub const PURPOSE_V2: &str = "kubetee.attestation.v2";
+
+/// Domain-separation tag for the v2 report-data derivation. Changing this
+/// string is a contract change (it is inside the frozen test vector).
+pub const KEY_ATTESTATION_TAG: &[u8] = b"kubetee.attestation.v2/ReportDataForKeyWithContext";
+
+/// Normalize + validate the caller nonce: 64 lowercase hex chars. ASCII-only
+/// (rejects control chars / Unicode whitespace that `trim()` alone would let
+/// through — zero-length-input bypass class, CVE-2026-92702).
 pub fn normalize_nonce(nonce: &str) -> Result<String, BindingError> {
+    if !nonce.is_ascii() {
+        return Err(BindingError::Mismatch(
+            "nonce must be ASCII hex".to_string(),
+        ));
+    }
     let n = nonce.trim().to_lowercase();
     if n.len() != 64 || !n.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(BindingError::Mismatch(format!(
@@ -73,13 +91,133 @@ pub fn report_data_legacy(nonce: &str) -> Result<[u8; 64], BindingError> {
     Ok(out)
 }
 
+/// Length-framed concatenation (`u64-be length ‖ bytes`) — the
+/// `ReportDataForKeyWithContext` transcript pattern. Framing prevents any two
+/// distinct `(pkix, nonce, context)` tuples from sharing a preimage.
+fn framed(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for p in parts {
+        out.extend_from_slice(&(p.len() as u64).to_be_bytes());
+        out.extend_from_slice(p);
+    }
+    out
+}
+
+/// The exact byte string the v2 report-data hash consumes:
+/// `SHA-384(tag ‖ framed(pkix_pubkey) ‖ framed(nonce) ‖ framed(context))` —
+/// the tag is raw (domain separation), the three inputs are length-framed.
+/// Inputs are DER PKIX SPKI bytes (`pkix_pubkey`), the caller nonce (raw 32
+/// bytes), and a UTF-8 domain-separation `context`.
+pub fn report_data_preimage_v2(
+    pkix_pubkey: &[u8],
+    nonce: &[u8],
+    context: &str,
+) -> Result<Vec<u8>, BindingError> {
+    if pkix_pubkey.is_empty() {
+        return Err(BindingError::Mismatch(
+            "v2 pkix_pubkey must be non-empty".to_string(),
+        ));
+    }
+    if nonce.is_empty() {
+        return Err(BindingError::Mismatch(
+            "v2 nonce must be non-empty".to_string(),
+        ));
+    }
+    if context.is_empty() {
+        return Err(BindingError::Mismatch(
+            "v2 context must be non-empty (no uncontextualized key binding)".to_string(),
+        ));
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(KEY_ATTESTATION_TAG);
+    out.extend_from_slice(&framed(&[pkix_pubkey, nonce, context.as_bytes()]));
+    Ok(out)
+}
+
+/// v2 `report_data` = `SHA-384(preimage) ‖ 16 zero bytes` (64 bytes total —
+/// the SNP report-data field size). The zero suffix keeps the field layout
+/// while reserving it against cross-purpose collisions.
+pub fn report_data_v2(
+    pkix_pubkey: &[u8],
+    nonce: &[u8],
+    context: &str,
+) -> Result<[u8; 64], BindingError> {
+    let preimage = report_data_preimage_v2(pkix_pubkey, nonce, context)?;
+    let mut hasher = Sha384::new();
+    hasher.update(&preimage);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 64];
+    out[..48].copy_from_slice(&digest);
+    Ok(out)
+}
+
+/// The JCS statement the envelope serves (and the backend signs) for v2:
+/// `{"context":..,"keyset_digest":..,"nonce":..,"pkix_pubkey_b64url":..,
+/// "purpose":"kubetee.attestation.v2"}`. `report_data_v2_statement` derives
+/// the served `report_data_statement`; verification recomputes both.
+pub fn report_data_statement_v2(
+    keyset_digest: &str,
+    nonce: &str,
+    pkix_pubkey_b64url: &str,
+    context: &str,
+) -> Result<String, BindingError> {
+    if !keyset_digest.starts_with("sha256:")
+        || keyset_digest.len() != 7 + 64
+        || !keyset_digest[7..].chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(BindingError::Mismatch(format!(
+            "malformed keyset_digest: {keyset_digest:?}"
+        )));
+    }
+    let nonce = normalize_nonce(nonce)?;
+    if pkix_pubkey_b64url.is_empty() {
+        return Err(BindingError::Mismatch(
+            "v2 pkix_pubkey_b64url must be non-empty".to_string(),
+        ));
+    }
+    if context.is_empty() {
+        return Err(BindingError::Mismatch(
+            "v2 context must be non-empty".to_string(),
+        ));
+    }
+    // JCS (sorted keys): context < keyset_digest < nonce < pkix_pubkey_b64url < purpose.
+    let v = serde_json::json!({
+        "context": context,
+        "keyset_digest": keyset_digest,
+        "nonce": nonce,
+        "pkix_pubkey_b64url": pkix_pubkey_b64url,
+        "purpose": PURPOSE_V2,
+    });
+    Ok(jcs(&v))
+}
+
+/// Decode the served `pkix_pubkey_b64url` (URL-safe, no pad — standard pad
+/// accepted). Fails closed on empty / bad base64.
+pub fn decode_pkix_pubkey(pkix_pubkey_b64url: &str) -> Result<Vec<u8>, BindingError> {
+    if pkix_pubkey_b64url.is_empty() {
+        return Err(BindingError::Mismatch(
+            "v2 pkix_pubkey_b64url is empty".to_string(),
+        ));
+    }
+    let mut s = pkix_pubkey_b64url.trim().to_string();
+    while !s.len().is_multiple_of(4) {
+        s.push('=');
+    }
+    URL_SAFE_NO_PAD
+        .decode(s.trim_end_matches('='))
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(&s))
+        .map_err(|e| BindingError::Mismatch(format!("v2 pkix_pubkey_b64url: {e}")))
+}
+
 /// Verify the envelope's binding chain end-to-end and fail closed on any
 /// mismatch:
-///   1. `bindings.version` is `kubetee.attestation.v1`.
+///   1. `bindings.version` is `kubetee.attestation.v1` (or `.v2`).
 ///   2. `bindings.keyset_digest` == `sha256(jcs(keyset))` (the served keyset).
 ///   3. `bindings.report_data_statement` == the recomputed statement.
-///   4. `snp.report_data` == `sha256(statement) || 32 zeros`.
-///   5. `evidence.quote_report_data` (if present) == `snp.report_data`.
+///   4. `snp.report_data` == the derived report data for the version.
+///   5. `evidence.quote_report_data` — when present it MUST equal
+///      `snp.report_data` (absent skips; a zero-length value FAILS CLOSED —
+///      never silently falls back, CVE-2026-92702 class).
 pub fn verify_binding(env: &Envelope) -> Result<String, BindingError> {
     let Bindings {
         version,
@@ -87,6 +225,15 @@ pub fn verify_binding(env: &Envelope) -> Result<String, BindingError> {
         keyset_digest: served_digest,
     } = &env.bindings;
 
+    if served_digest.is_empty() || served_statement.is_empty() {
+        return Err(BindingError::Mismatch(
+            "expectation-absent: keyset_digest/report_data_statement empty".to_string(),
+        ));
+    }
+
+    if version == PURPOSE_V2 {
+        return verify_binding_v2_inner(env, served_statement, served_digest);
+    }
     if version != PURPOSE {
         return Err(BindingError::BadVersion(version.clone()));
     }
@@ -113,15 +260,104 @@ pub fn verify_binding(env: &Envelope) -> Result<String, BindingError> {
         ));
     }
 
-    if let Some(qrd) = env.quote_report_data
-        && qrd != env.snp.report_data
-    {
+    cross_check_quote_report_data(env)?;
+
+    Ok(computed_digest)
+}
+
+/// v2 chain: the served statement's `pkix_pubkey_b64url` + `context` must
+/// reproduce `snp.report_data` via `report_data_v2`, and the served statement
+/// must be the JCS form of exactly those values (anti-downgrade: the fields in
+/// the statement are re-verified against the derivation, not trusted).
+fn verify_binding_v2_inner(
+    env: &Envelope,
+    served_statement: &str,
+    served_digest: &str,
+) -> Result<String, BindingError> {
+    let computed_digest = keyset_digest(&env.keyset);
+    if computed_digest != *served_digest {
+        return Err(BindingError::Mismatch(format!(
+            "keyset_digest: computed {computed_digest}, served {served_digest}"
+        )));
+    }
+
+    // Parse the served statement (JCS JSON) and re-derive it.
+    let v: serde_json::Value = serde_json::from_str(served_statement)
+        .map_err(|e| BindingError::Mismatch(format!("v2 statement is not JSON: {e}")))?;
+    let pkix_b64 = v
+        .get("pkix_pubkey_b64url")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| {
+            BindingError::Mismatch("v2 statement missing pkix_pubkey_b64url".to_string())
+        })?;
+    let context = v
+        .get("context")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| BindingError::Mismatch("v2 statement missing context".to_string()))?;
+    let stmt_nonce = v
+        .get("nonce")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| BindingError::Mismatch("v2 statement missing nonce".to_string()))?;
+    if normalize_nonce(stmt_nonce)? != normalize_nonce(&env.nonce)? {
+        return Err(BindingError::Mismatch(
+            "v2 statement nonce != envelope nonce".to_string(),
+        ));
+    }
+
+    let computed_statement =
+        report_data_statement_v2(served_digest, &env.nonce, pkix_b64, context)?;
+    if computed_statement != *served_statement {
+        return Err(BindingError::Mismatch(format!(
+            "v2 report_data_statement mismatch:\n  computed {computed_statement}\n  served   {served_statement}"
+        )));
+    }
+
+    let pkix = decode_pkix_pubkey(pkix_b64)?;
+    let nonce = normalize_nonce(&env.nonce)?;
+    let expected_rd = report_data_v2(&pkix, &bytes_from_hex32(&nonce)?, context)?;
+    if expected_rd != env.snp.report_data {
+        return Err(BindingError::Mismatch(
+            "v2 report_data != SHA-384(tag||framed(pkix)||framed(nonce)||framed(context))||16-zeros"
+                .to_string(),
+        ));
+    }
+
+    cross_check_quote_report_data(env)?;
+
+    Ok(computed_digest)
+}
+
+/// `evidence.quote_report_data` cross-check (fail closed): present-and-empty
+/// FAILS; present-and-non-empty MUST equal `snp.report_data`; absent is a
+/// skip (the field is optional on older captures).
+fn cross_check_quote_report_data(env: &Envelope) -> Result<(), BindingError> {
+    let Some(qrd) = env.quote_report_data.as_ref() else {
+        return Ok(());
+    };
+    if qrd.iter().all(|b| *b == 0) {
+        return Err(BindingError::Mismatch(
+            "quote_report_data is zero-length/blank (fail-closed: never skip the check)"
+                .to_string(),
+        ));
+    }
+    if qrd != &env.snp.report_data {
         return Err(BindingError::Mismatch(
             "quote_report_data != snp.report_data (evidence inconsistent)".to_string(),
         ));
     }
+    Ok(())
+}
 
-    Ok(computed_digest)
+fn bytes_from_hex32(hex_str: &str) -> Result<Vec<u8>, BindingError> {
+    if hex_str.len() != 64 || !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(BindingError::Mismatch("nonce hex length".to_string()));
+    }
+    (0..32)
+        .map(|i| {
+            u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16)
+                .map_err(|e| BindingError::Mismatch(format!("nonce hex: {e}")))
+        })
+        .collect()
 }
 
 /// Verify the TLS possession proof + the SPKI pin against the served keyset.
