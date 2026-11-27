@@ -14,6 +14,10 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // CLI arg enum: the `Verify` command carries
+// many optional path/flag args; boxing them adds indirection with no benefit
+// (this enum is constructed once and never lives on a hot path). The size
+// difference between `Verify` and the tiny `Inspect` variant is expected.
 enum Cmd {
     /// Verify an evidence envelope file against AMD KDS + the .well-known references.
     Verify {
@@ -32,6 +36,16 @@ enum Cmd {
         /// Path to the signed TDX registry (`tee-measurements-registry.json`).
         #[arg(long)]
         registry: Option<PathBuf>,
+        /// Additional served registry revisions for anti-rollback history
+        /// verification (repeatable). Together with `--registry` they form the
+        /// chain-linked run; a chain-less registry is rejected.
+        #[arg(long = "registry-revision")]
+        registry_revision: Vec<PathBuf>,
+        /// Monotonic floor: the highest `version` this verifier has ever
+        /// accepted (persist it across checks). Rejects any served revision
+        /// below it — closes the stale-pre-revocation-registry hole.
+        #[arg(long)]
+        min_revision: Option<u64>,
         /// Pinned measurements signing key (base64url, 32 bytes). Omit to skip sig check.
         #[arg(long)]
         signing_key: Option<String>,
@@ -103,6 +117,8 @@ fn main() {
             tls_domain,
             reference,
             registry,
+            registry_revision,
+            min_revision,
             signing_key,
             kds: use_kds,
             vcek,
@@ -151,6 +167,12 @@ fn main() {
             let registry_doc = registry
                 .map(|p| read(&p))
                 .and_then(|s| serde_json::from_str(&s).ok());
+            let revision_docs: Vec<serde_json::Value> = registry_revision
+                .iter()
+                .filter_map(|p| serde_json::from_str(&read(p)).ok())
+                .collect();
+            let hist: Vec<&serde_json::Value> =
+                registry_doc.iter().chain(revision_docs.iter()).collect();
             let tls_leaf_der = tls_leaf.as_ref().and_then(read_leaf);
 
             let input = kv::VerifyInput {
@@ -160,6 +182,12 @@ fn main() {
                 vcek_pem,
                 snp_reference: reference_doc.as_ref(),
                 registry: registry_doc.as_ref(),
+                registry_history: if hist.is_empty() {
+                    None
+                } else {
+                    Some(hist.as_slice())
+                },
+                min_revision,
                 tls_leaf_der: tls_leaf_der.as_deref(),
                 tls_domain: &tls_domain,
                 signing_key_b64url: signing_key

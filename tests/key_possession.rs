@@ -224,6 +224,8 @@ fn v2_step5_dispatch_requires_key_possession() {
         vcek_pem: None,
         snp_reference: None,
         registry: None,
+        registry_history: None,
+        min_revision: None,
         tls_leaf_der: Some(&leaf),
         tls_domain: "llm.kubetee.ai",
         signing_key_b64url: None,

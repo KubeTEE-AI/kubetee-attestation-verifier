@@ -77,6 +77,19 @@ pub struct VerifyInput<'a> {
     pub snp_reference: Option<&'a serde_json::Value>,
     /// The signed TDX registry doc (`tee-measurements-registry.json`).
     pub registry: Option<&'a serde_json::Value>,
+    /// Optional additional served registry revisions (ascending or unordered).
+    /// When `Some`, the whole run is verified as one chain-linked history;
+    /// when `None`, `registry` is verified as a single revision against its own
+    /// chain + the `min_revision` floor. Together these enforce Phase 6 §3.2
+    /// anti-rollback: a chain-less registry is REJECTED (no downgrade to the
+    /// un-chained form), and nothing below `min_revision` is accepted.
+    pub registry_history: Option<&'a [&'a serde_json::Value]>,
+    /// Monotonic floor: the highest `version` this verifier has ever accepted
+    /// (persisted across checks). Any served revision below it is rejected —
+    /// this is what closes the "serve a stale pre-revocation registry" hole
+    /// (the stale doc has a valid signature and a self-consistent chain, so
+    /// only the floor catches it). `None` skips the floor (fresh verifier).
+    pub min_revision: Option<u64>,
     /// Raw TLS leaf (DER) served on the connection.
     pub tls_leaf_der: Option<&'a [u8]>,
     pub tls_domain: &'a str,
@@ -134,6 +147,27 @@ pub fn verify(input: &VerifyInput<'_>) -> Verdict {
         }
     }
     if let Some(registry) = input.registry {
+        // (3.5) Anti-rollback: chain + monotonic floor (Phase 6 §3.2). Runs for
+        // ANY supplied registry, before its records are used for matching — and
+        // even for a pure-SNP envelope — because the registry is the trust
+        // root: a client that persists `min_revision` must never accept a
+        // rolled-back, chain-less, or splice-history registry. A present-but-
+        // unchained registry is REJECTED (no silent downgrade to the un-chained
+        // form, CVE-2026-100833 class).
+        let single = [registry];
+        let docs: &[&serde_json::Value] = match input.registry_history {
+            Some(h) => h,
+            None => single.as_slice(),
+        };
+        match verify_history(docs, input.min_revision) {
+            Ok((version, transition)) => lines.push(format!(
+                "PASS registry-anti-rollback chain-links revision {version} \
+                 transition {transition} floor {:?}",
+                input.min_revision
+            )),
+            Err(e) => fail(&mut lines, format!("registry-anti-rollback: {e}")),
+        }
+
         // The registry's `records[]` are TDX BACKEND registers. A pure SNP
         // gateway envelope has none -- the SNP measurement match above is the
         // right check. Skip (do not false-FAIL) when no TDX relay is present.

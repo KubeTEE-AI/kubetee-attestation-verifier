@@ -61,6 +61,8 @@ fn v4_verify_passes_self_contained() {
         vcek_pem: None,
         snp_reference: Some(&reference),
         registry: None,
+        registry_history: None,
+        min_revision: None,
         tls_leaf_der: None,
         tls_domain: "llm.kubetee.ai",
         signing_key_b64url: Some(kv::registry::DEFAULT_SIGNING_KEY_B64URL),
