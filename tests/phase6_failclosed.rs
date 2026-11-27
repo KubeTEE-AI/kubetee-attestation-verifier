@@ -216,7 +216,10 @@ fn fixture_no_match_accepts() {
 // §3.2 registry anti-rollback: transition-hash chain
 // ---------------------------------------------------------------------------
 
-/// A signed revision whose `chain` reproduces end-to-end.
+/// A signed revision whose `chain` reproduces end-to-end. This is also the
+/// cross-language KNOWN-ANSWER vector shared with the Python publisher
+/// (`kubetee-website/tests/test_registry_chain.py`) — the two implementations
+/// must produce these exact hashes from this exact document.
 #[test]
 fn transition_chain_verifies() {
     let mut doc = serde_json::json!({
@@ -229,6 +232,15 @@ fn transition_chain_verifies() {
     let content = kv::content_hash(&doc);
     let prev = kv::GENESIS_PREVIOUS.to_string();
     let trans = kv::transition_hash(&content, &prev);
+    // KAT: pinned hex shared with the Python publisher.
+    assert_eq!(
+        content, "3d318863138b6a27f349d62da67edce436b7ce0ae552b3b1875a7fa1599f5760",
+        "content_hash diverged from the Python publisher KAT"
+    );
+    assert_eq!(
+        trans, "a4352972c6c47ac9234cdd9f332d22c757ebd506352691f7a2eee9b5849a3be5",
+        "transition_hash diverged from the Python publisher KAT"
+    );
     doc["chain"] = serde_json::json!({
         "content_hash": content,
         "previous_transition_hash": prev,
