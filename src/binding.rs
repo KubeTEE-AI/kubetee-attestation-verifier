@@ -12,6 +12,8 @@ pub enum BindingError {
     BadVersion(String),
     #[error("TLS possession proof failed: {0}")]
     TlsPossession(String),
+    #[error("key possession proof failed: {0}")]
+    KeyPossession(String),
 }
 
 /// `report_data_input` values the envelope accepts.
@@ -51,6 +53,11 @@ pub fn normalize_nonce(nonce: &str) -> Result<String, BindingError> {
 pub fn keyset_digest(keyset: &Keyset) -> String {
     format!("sha256:{}", sha256_hex(jcs(&keyset.raw).as_bytes()))
 }
+
+/// The `key_possession.input` the v2 proof must name.
+pub const POSSESSION_INPUT: &str = "quote_report_data";
+/// The `key_possession.alg` the v2 proof must name (ECDSA P-256 / SHA-256).
+pub const POSSESSION_ALG: &str = "ecdsa-secp256r1-sha256";
 
 /// The exact byte string hashed into `report_data` for `kubetee.attestation.v1`:
 /// `{"keyset_digest":..,"nonce":..,"purpose":"kubetee.attestation.v1"}` (JCS order).
@@ -376,38 +383,9 @@ pub fn verify_tls_possession(
         .as_ref()
         .ok_or_else(|| BindingError::TlsPossession("envelope has no tls_possession".to_string()))?;
 
-    // SPKI pin: the served keyset must name THIS TLS leaf.
-    let spki_sha = spki_sha256(leaf)?;
-    let expected = env
-        .keyset
-        .tls_public_keys
-        .iter()
-        .find(|k| k.domain == tls_domain)
-        .map(|k| k.spki_sha256.trim_start_matches("sha256:").to_lowercase())
-        .ok_or_else(|| {
-            BindingError::TlsPossession(format!("keyset names no tls key for domain {tls_domain}"))
-        })?;
-    if spki_sha != expected {
-        return Err(BindingError::TlsPossession(format!(
-            "TLS SPKI pin mismatch: leaf {spki_sha}, keyset {expected}"
-        )));
-    }
-    if let Some(cert_fp) = &tp.tls_cert_sha256 {
-        use x509_cert::der::Encode;
-        // Envelope also reports the cert fingerprint (sha256 over the cert's
-        // DER); it must match the served leaf's DER.
-        let der = leaf
-            .to_der()
-            .map_err(|e| BindingError::TlsPossession(format!("cert DER: {e}")))?;
-        let der_fp = sha256_hex(&der);
-        if cert_fp.trim_start_matches("sha256:").to_lowercase() != der_fp {
-            return Err(BindingError::TlsPossession(format!(
-                "tls_cert_sha256 {cert_fp} != leaf cert sha256 {der_fp}"
-            )));
-        }
-    }
+    verify_spki_pin(env, tls_domain, leaf)?;
 
-    // Possession: a signature over the nonce under the leaf key.
+    // Possession (v1): a signature over the nonce under the leaf key.
     if tp.tls_signature_input != "sha256(nonce)" {
         return Err(BindingError::TlsPossession(format!(
             "unsupported tls_signature_input {}",
@@ -493,4 +471,126 @@ fn verify_tls_signature(
             "unsupported tls_signature_alg {other:?}"
         ))),
     }
+}
+
+/// The SPKI-pin check shared by the v1 (TLS-possession) and v2 (key-
+/// possession) paths: the served keyset must name THIS TLS leaf's SPKI (and,
+/// when the envelope reports it, the leaf certificate fingerprint).
+///
+/// - `spki_sha256` of the leaf must equal the served
+///   `tls_public_keys[].spki_sha256` for `tls_domain`.
+/// - `tls_cert_sha256` (when present) must equal the leaf cert's DER sha256.
+pub fn verify_spki_pin(
+    env: &Envelope,
+    tls_domain: &str,
+    leaf: &x509_cert::Certificate,
+) -> Result<(), BindingError> {
+    let spki_sha = spki_sha256(leaf)?;
+    let expected = env
+        .keyset
+        .tls_public_keys
+        .iter()
+        .find(|k| k.domain == tls_domain)
+        .map(|k| k.spki_sha256.trim_start_matches("sha256:").to_lowercase())
+        .ok_or_else(|| {
+            BindingError::TlsPossession(format!("keyset names no tls key for domain {tls_domain}"))
+        })?;
+    if spki_sha != expected {
+        return Err(BindingError::TlsPossession(format!(
+            "TLS SPKI pin mismatch: leaf {spki_sha}, keyset {expected}"
+        )));
+    }
+    if let Some(cert_fp) = &env
+        .tls_possession
+        .as_ref()
+        .and_then(|tp| tp.tls_cert_sha256.as_ref())
+    {
+        use x509_cert::der::Encode;
+        let der = leaf
+            .to_der()
+            .map_err(|e| BindingError::TlsPossession(format!("cert DER: {e}")))?;
+        let der_fp = sha256_hex(&der);
+        if cert_fp.trim_start_matches("sha256:").to_lowercase() != der_fp {
+            return Err(BindingError::TlsPossession(format!(
+                "tls_cert_sha256 {cert_fp} != leaf cert sha256 {der_fp}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Verify the v2 quote-bound key-possession proof (the zero-operator-trust
+/// step): the `key_possession` ECDSA P-256/SHA-256 signature over the quote-
+/// bound 64-byte `report_data` must verify under the **per-boot in-guest
+/// generated** key the v2 statement commits (`pkix_pubkey_b64url`) — never
+/// under the operator-custodied TLS leaf. This proves the guest holds the
+/// fresh per-boot key the hardware quote bound.
+///
+/// Fail-closed: a missing proof, a mislabelled `input`/`alg`, a bad encoding,
+/// or a signature under any other key is an error.
+pub fn verify_key_possession(env: &Envelope) -> Result<(), BindingError> {
+    let kp = env
+        .key_possession
+        .as_ref()
+        .ok_or_else(|| BindingError::KeyPossession("envelope has no key_possession".to_string()))?;
+    if kp.input != POSSESSION_INPUT {
+        return Err(BindingError::KeyPossession(format!(
+            "key_possession input is {}, expected {POSSESSION_INPUT}",
+            kp.input
+        )));
+    }
+    if kp.alg != POSSESSION_ALG {
+        return Err(BindingError::KeyPossession(format!(
+            "key_possession alg is {}, expected {POSSESSION_ALG}",
+            kp.alg
+        )));
+    }
+
+    // The bound key: the per-boot key the v2 statement commits.
+    let served = &env.bindings.report_data_statement;
+    let v: serde_json::Value = serde_json::from_str(served)
+        .map_err(|e| BindingError::KeyPossession(format!("v2 statement is not JSON: {e}")))?;
+    let pkix_b64 = v
+        .get("pkix_pubkey_b64url")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| {
+            BindingError::KeyPossession("v2 statement missing pkix_pubkey_b64url".to_string())
+        })?;
+    let pkix = decode_pkix_pubkey(pkix_b64)?;
+
+    let sig = URL_SAFE_NO_PAD
+        .decode(kp.signature_b64.as_str())
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(kp.signature_b64.as_str()))
+        .map_err(|e| BindingError::KeyPossession(format!("bad key_possession signature: {e}")))?;
+
+    use p256::ecdsa::VerifyingKey;
+    use p256::ecdsa::signature::Verifier as _;
+    use spki::DecodePublicKey as _;
+    let vk = VerifyingKey::from_public_key_der(&pkix)
+        .map_err(|e| BindingError::KeyPossession(format!("v2 bound key (SPKI): {e}")))?;
+    let signature = parse_p256_signature(&sig)?;
+    vk.verify(&env.snp.report_data, &signature)
+        .map_err(|_| BindingError::KeyPossession("signature does not verify".to_string()))
+}
+
+/// Parse an ECDSA P-256 signature: DER (ASN.1) first — the canonical wire
+/// encoding the generator (cryptography / ring ECDSA) produces — then the
+/// fixed raw `r||s` form (parity with gm-miner).
+fn parse_p256_signature(sig: &[u8]) -> Result<p256::ecdsa::Signature, BindingError> {
+    use p256::ecdsa::Signature;
+    if let Ok(s) = Signature::from_der(sig) {
+        return Ok(s);
+    }
+    if sig.len() == 64 {
+        let mut r = [0u8; 32];
+        r.copy_from_slice(&sig[..32]);
+        let mut s = [0u8; 32];
+        s.copy_from_slice(&sig[32..]);
+        if let Ok(s) = Signature::from_scalars(r, s) {
+            return Ok(s);
+        }
+    }
+    Err(BindingError::KeyPossession(
+        "bad ECDSA signature encoding".to_string(),
+    ))
 }

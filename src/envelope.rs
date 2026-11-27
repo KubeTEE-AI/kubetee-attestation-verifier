@@ -192,6 +192,21 @@ pub struct TlsPossession {
     pub tls_cert_sha256: Option<String>,
 }
 
+/// The v2 possession proof (`kubetee.attestation.v2`): an ECDSA P-256/SHA-256
+/// signature over the quote-bound 64-byte `report_data`, under the **per-boot
+/// in-guest generated** key the v2 statement commits (`pkix_pubkey_b64url`).
+/// This replaces `tls_possession` in v2 — the operator-custodied serving key
+/// plays no part in it.
+#[derive(Debug, Clone)]
+pub struct KeyPossession {
+    /// The input class the signature covers: must be `quote_report_data`.
+    pub input: String,
+    /// The signature algorithm: must be `ecdsa-secp256r1-sha256`.
+    pub alg: String,
+    /// The signature over the raw 64 report-data bytes (standard base64).
+    pub signature_b64: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Envelope {
     pub nonce: String,
@@ -202,6 +217,8 @@ pub struct Envelope {
     pub keyset: Keyset,
     pub bindings: Bindings,
     pub tls_possession: Option<TlsPossession>,
+    /// The v2 quote-bound key-possession proof (absent on v1 envelopes).
+    pub key_possession: Option<KeyPossession>,
     /// `evidence.snp.cert_chain` (VCEK/ASK/ARK since gateway .6; empty before).
     pub cert_chain: Vec<CertEntry>,
     pub snp: SnpReport,
@@ -473,6 +490,29 @@ pub fn parse_envelope(doc: &str) -> Result<Envelope, ParseError> {
         })
     });
 
+    // Present-but-malformed must FAIL the parse (fail closed), never silently
+    // drop to `None` and skip the possession check (CVE-2026-92702 class).
+    let key_possession = match v.get("key_possession") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(kp) => Some(KeyPossession {
+            input: kp
+                .get("input")
+                .and_then(|x| x.as_str())
+                .ok_or(ParseError::Missing("key_possession.input"))?
+                .to_string(),
+            alg: kp
+                .get("alg")
+                .and_then(|x| x.as_str())
+                .ok_or(ParseError::Missing("key_possession.alg"))?
+                .to_string(),
+            signature_b64: kp
+                .get("signature_b64")
+                .and_then(|x| x.as_str())
+                .ok_or(ParseError::Missing("key_possession.signature_b64"))?
+                .to_string(),
+        }),
+    };
+
     let cert_chain: Vec<CertEntry> = snp_node
         .get("cert_chain")
         .and_then(|c| c.as_array())
@@ -562,6 +602,7 @@ pub fn parse_envelope(doc: &str) -> Result<Envelope, ParseError> {
         keyset,
         bindings,
         tls_possession,
+        key_possession,
         cert_chain,
         snp,
         quote_report_data,
