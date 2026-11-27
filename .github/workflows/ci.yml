@@ -1,0 +1,39 @@
+# CI — build + lint + test on every push/PR.
+#
+# This verifier is FAIL-CLOSED: nothing merges that cannot verify. The
+# `tests/` suites (`self_contained.rs` vectors + `verify_live.rs` fixture
+# captures) run offline in ~1s, so there is no excuse for them to rot.
+#
+# Supply-chain hygiene (zizmor-style): actions pinned to full commit SHAs,
+# minimal `contents: read` permissions, no third-party action beyond checkout
+# (toolchain comes from the runner's rustup — no remote install script).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Toolchain (stable + rustfmt + clippy)
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Format (no diffs allowed)
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests (vectors + fixture captures, offline)
+        run: cargo test
