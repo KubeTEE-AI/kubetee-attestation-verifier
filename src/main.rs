@@ -125,7 +125,12 @@ fn main() {
             ark,
             ask,
         } => {
-            let env = parse_or_exit(&read(&evidence));
+            let raw: serde_json::Value =
+                serde_json::from_str(&read(&evidence)).unwrap_or_else(|e| {
+                    eprintln!("cannot parse evidence: {e}");
+                    std::process::exit(2);
+                });
+            let env = parse_or_exit(&raw.to_string());
 
             // (1) Chain: explicit PEMs > AMD KDS > the envelope's own cert_chain
             // (self-contained, gateway 1.110.2-kubetee.6). An empty/partial
@@ -176,6 +181,7 @@ fn main() {
             let tls_leaf_der = tls_leaf.as_ref().and_then(read_leaf);
 
             let input = kv::VerifyInput {
+                raw: &raw,
                 envelope: &env,
                 ark_pem,
                 ask_pem,

@@ -16,7 +16,118 @@
 use crate::envelope::{SnpReport, jcs};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha384};
+
+/// TEE-side evidence covered by the verbatim InitData check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeploymentConfigSurface {
+    Snp,
+    TdxBackend,
+}
+
+/// Hash `vm_config.initdata_toml` exactly as served and bind it to signed
+/// hardware measurements. A backend envelope is checked whenever present;
+/// gateway-only evidence reports that only the SNP deployment was checked.
+pub fn verify_deployment_config(
+    raw: &serde_json::Value,
+) -> Result<Vec<DeploymentConfigSurface>, RegistryError> {
+    let evidence = raw
+        .get("evidence")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            RegistryError::Rejected("deployment-config: full evidence.evidence absent".into())
+        })?;
+    let mut surfaces = Vec::new();
+    let vm = evidence
+        .get("vm_config")
+        .ok_or_else(|| absent("evidence.vm_config"))?;
+    let host_data = vm
+        .get("host_data")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| absent("evidence.vm_config.host_data"))?;
+    // The SNP firmware receives only the first 32 bytes of the SHA-384
+    // InitData digest: a full TOML is the authoritative preimage.
+    let document = verbatim(vm, "initdata_toml")?;
+    let digest = hex::encode(&Sha384::digest(document.as_bytes())[..32]);
+    if !expected_hex(host_data, 32).eq_ignore_ascii_case(&digest) {
+        return Err(RegistryError::Rejected(
+            "snp.host_data != sha384(initdata_toml)[..32]".into(),
+        ));
+    }
+    surfaces.push(DeploymentConfigSurface::Snp);
+    if let Some(backend_key) = ["backend", "tdx"]
+        .into_iter()
+        .find(|key| evidence.get(*key).is_some())
+    {
+        let backend = &evidence[backend_key];
+        let vm = backend
+            .get("vm_config")
+            .ok_or_else(|| absent("backend.vm_config"))?;
+        let document = verbatim(vm, "initdata_toml")?;
+        let digest = hex::encode(Sha384::digest(document.as_bytes()));
+        let body = backend.get("regs").or_else(|| {
+            backend
+                .get("claims")
+                .and_then(|c| c.get("quote"))
+                .and_then(|q| q.get("body"))
+        });
+        let got = body
+            .and_then(|b| b.get("mr_config_id"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| absent("backend.regs.mr_config_id"))?;
+        if !expected_hex(got, 48).eq_ignore_ascii_case(&digest) {
+            return Err(RegistryError::Rejected(
+                "tdx.mrconfigid != sha384(backend.initdata_toml)".into(),
+            ));
+        }
+        surfaces.push(DeploymentConfigSurface::TdxBackend);
+    }
+    if surfaces.is_empty() {
+        return Err(absent(
+            "evidence.vm_config (full bundle, not compact inline)",
+        ));
+    }
+    Ok(surfaces)
+}
+
+fn absent(field: &str) -> RegistryError {
+    RegistryError::Rejected(format!("deployment-config: {field} absent"))
+}
+fn verbatim<'a>(vm: &'a serde_json::Value, field: &str) -> Result<&'a str, RegistryError> {
+    vm.get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| absent(field))
+}
+fn expected_hex(value: &str, length: usize) -> &str {
+    let value = value.strip_prefix("hex:").unwrap_or(value);
+    if value.len() == 2 * length && value.chars().all(|character| character.is_ascii_hexdigit()) {
+        value
+    } else {
+        ""
+    }
+}
+
+/// Extract TDX registers from the LIVE byte-level document (including nested
+/// backend forms). Do not trust a record merely because its image reference
+/// names a valid digest: measured InitData has its own hardware binding.
+pub fn tdx_evidence_node(raw: &serde_json::Value) -> Option<serde_json::Value> {
+    let evidence = raw.get("evidence")?;
+    for key in ["backend", "tdx"] {
+        if let Some(node) = evidence.get(key).filter(|v| !v.is_null()) {
+            return Some(node.clone());
+        }
+    }
+    evidence
+        .get("attestation_evidence")
+        .and_then(|list| list.as_array())
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("tee").and_then(serde_json::Value::as_str) == Some("tdx"))
+                .cloned()
+        })
+}
 
 pub const REGISTRY_SCHEMA: &str = "kubetee.tee-measurements-registry/1";
 pub const REFERENCE_SCHEMA: &str = "kubetee.tee-measurements/2";

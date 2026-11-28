@@ -57,8 +57,10 @@ fn v4_self_contained_chain_and_signature_verify() {
 #[test]
 fn v4_verify_passes_self_contained() {
     let env = v4_envelope();
+    let raw: serde_json::Value = serde_json::from_str(EVIDENCE_V4).expect("fixture parses");
     let reference: serde_json::Value = serde_json::from_str(REFERENCE_V4).unwrap();
     let input = kv::VerifyInput {
+        raw: &raw,
         envelope: &env,
         ark_pem: None,
         ask_pem: None,

@@ -42,9 +42,10 @@ pub use binding::{
 };
 pub use envelope::{CertEntry, Envelope, KeyPossession, ParseError, SnpReport, parse_envelope};
 pub use registry::{
-    GENESIS_PREVIOUS, Record, RegistryError, TRANSITION_TAG, content_hash, match_any_active_record,
-    match_snp_reference, registry_records, tdx_regs, transition_hash, verify_chain_links,
-    verify_history, verify_registry_signature,
+    DeploymentConfigSurface, GENESIS_PREVIOUS, Record, RegistryError, TRANSITION_TAG, content_hash,
+    match_any_active_record, match_snp_reference, registry_records, tdx_evidence_node, tdx_regs,
+    transition_hash, verify_chain_links, verify_deployment_config, verify_history,
+    verify_registry_signature,
 };
 pub use snp::{
     SnpError, build_chain, chain_from_envelope, kds_product, verify_chain, verify_report_signature,
@@ -65,6 +66,8 @@ impl Verdict {
 }
 
 pub struct VerifyInput<'a> {
+    /// Exact, full evidence bundle, not a compact inline header envelope.
+    pub raw: &'a serde_json::Value,
     pub envelope: &'a Envelope,
     /// PEM from AMD KDS (or user-supplied). **Optional** — when `None`, the
     /// report chain is derived from the envelope's own `cert_chain` (the
@@ -104,6 +107,22 @@ pub fn verify(input: &VerifyInput<'_>) -> Verdict {
         lines.push(format!("FAIL {msg}"));
     };
 
+    // The explicit protocol label must match the cryptosystem the verifier
+    // reconstructed; an otherwise-valid quote cannot silently relabel v2.
+    if input.envelope.report_data_input != PURPOSE_V2 {
+        fail(
+            &mut lines,
+            format!(
+                "protocol-label report_data_input {:?} is not {:?}",
+                input.envelope.report_data_input, PURPOSE_V2
+            ),
+        );
+    } else {
+        lines.push(format!(
+            "PASS protocol-label report_data_input = {PURPOSE_V2}"
+        ));
+    }
+
     // (1)+(2) AMD chain + report signature. Prefer explicit PEMs (AMD KDS /
     // offline), else self-contained: derive ARK/ASK/VCEK from the envelope's
     // own `cert_chain` (gateway 1.110.2-kubetee.6 delivers the full chain).
@@ -132,6 +151,10 @@ pub fn verify(input: &VerifyInput<'_>) -> Verdict {
     };
 
     // (4) Reference measurement match.
+    match verify_deployment_config(input.raw) {
+        Ok(_) => lines.push("PASS deployment-config sha384(initdata_toml) binds SNP host_data and any TDX mrconfigid".into()),
+        Err(e) => fail(&mut lines, format!("deployment-config: {e}")),
+    }
     if let Some(reference) = input.snp_reference {
         if let Some(key) = input.signing_key_b64url {
             match verify_registry_signature(reference, key) {
@@ -172,7 +195,7 @@ pub fn verify(input: &VerifyInput<'_>) -> Verdict {
         // The registry's `records[]` are TDX BACKEND registers. A pure SNP
         // gateway envelope has none -- the SNP measurement match above is the
         // right check. Skip (do not false-FAIL) when no TDX relay is present.
-        match &input.envelope.tdx_evidence {
+        match &tdx_evidence_node(input.raw) {
             None => {
                 lines.push(
                     "SKIP registry-match (no TDX backend relay in this SNP envelope)".to_string(),

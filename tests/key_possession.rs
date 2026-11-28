@@ -126,6 +126,7 @@ fn v2_step5_dispatch_requires_key_possession() {
     let env = v2_envelope(&key, &nonce_hex(0xaa), "ctx", rd(0x31), None);
     let leaf = tls_leaf();
     let input = kv::VerifyInput {
+        raw: &serde_json::from_str(include_str!("fixtures/live_evidence_v4.json")).unwrap(),
         envelope: &env,
         ark_pem: None,
         ask_pem: None,

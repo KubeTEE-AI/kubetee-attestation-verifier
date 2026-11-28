@@ -51,7 +51,9 @@ fn verify_with_registry(
     min_revision: Option<u64>,
 ) -> kv::Verdict {
     let env = envelope();
+    let raw: serde_json::Value = serde_json::from_str(EVIDENCE_V4).unwrap();
     kv::verify(&kv::VerifyInput {
+        raw: &raw,
         envelope: &env,
         ark_pem: None,
         ask_pem: None,
