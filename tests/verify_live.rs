@@ -10,8 +10,6 @@
 use kubetee_attestation_verifier as kv;
 
 /// Live capture (2026-11-26, `GET /v1/attestation?nonce=...`).
-use x509_cert::der::Decode;
-
 pub const LIVE_EVIDENCE: &str = include_str!("fixtures/live_evidence.json");
 /// AMD KDS VCEK for the live report's chip_id + reported TCB (blSPL=12
 /// teeSPL=0 snpSPL=28 ucodeSPL=88), PEM.
@@ -70,34 +68,19 @@ fn live_chain_verifies() {
 }
 
 /// The binding chain (nonce + keyset digest + statement -> report_data).
+///
+/// The 2026-11-26 live capture is a LEGACY v1 envelope (its `report_data` is
+/// the v1 `sha256(statement)||32-zeros` value), which the v2-only verifier
+/// **hard rejects** — pinned here as the fail-closed retire-v1 proof. The
+/// positive v2 binding path is pinned by the synthetic-v2 vectors in
+/// `self_contained.rs` / `key_possession.rs`.
 #[test]
-fn live_binding_verifies() {
+fn live_v1_envelope_is_rejected_fail_closed() {
     let env = live_envelope();
-    let digest = kv::verify_binding(&env).expect("live binding verifies");
-    assert_eq!(
-        digest,
-        "sha256:3a6615110163ab6c6e011057d51050738892313c697b186a7137c67c9018f0a8"
+    assert!(
+        kv::verify_binding(&env).is_err(),
+        "legacy v1 capture must be rejected (v2 is the only accepted version)"
     );
-}
-
-/// The signed SNP reference (launch_measurement + host_data + report_version).
-#[test]
-fn live_report_matches_signed_reference() {
-    let env = live_envelope();
-    let reference: serde_json::Value = serde_json::from_str(LIVE_REFERENCE).unwrap();
-    kv::match_snp_reference(&env.snp, &reference).expect("live report matches reference");
-    kv::verify_registry_signature(&reference, kv::registry::DEFAULT_SIGNING_KEY_B64URL)
-        .expect("reference signature verifies");
-}
-
-/// TLS possession + SPKI pin against the live leaf.
-#[test]
-fn live_tls_possession_verifies() {
-    use base64::{Engine, engine::general_purpose::STANDARD};
-    let env = live_envelope();
-    let der = STANDARD.decode(LIVE_TLS_LEAF_DER_B64.trim()).unwrap();
-    let leaf = x509_cert::Certificate::from_der(&der).unwrap();
-    kv::verify_tls_possession(&env, "llm.kubetee.ai", &leaf).expect("TLS possession verifies");
 }
 
 /// FAIL-CLOSED: a tampered nonce must not verify the binding.
@@ -177,19 +160,29 @@ fn tampered_registry_signature_fails() {
     );
 }
 
-/// FAIL-CLOSED: a wrong TLS SPKI must not verify possession.
+/// FAIL-CLOSED: a wrong TLS SPKI must not verify the SPKI pin. The legacy v1
+/// capture's `tls_possession` is retired; this vector corrupts a v2 envelope's
+/// keyset pin instead.
 #[test]
-fn wrong_tls_spki_fails_possession() {
-    use base64::{Engine, engine::general_purpose::STANDARD};
-    let env = live_envelope();
-    let der = STANDARD.decode(LIVE_TLS_LEAF_DER_B64.trim()).unwrap();
-    let leaf = x509_cert::Certificate::from_der(&der).unwrap();
-    let mut env2 = env.clone();
-    if let Some(tp) = &mut env2.tls_possession {
-        tp.tls_cert_sha256 = Some("00".repeat(32));
+fn wrong_tls_spki_fails_pin() {
+    let key = common::BootKey::from_seed(0x41);
+    let mut env = common::v2_envelope(
+        &key,
+        &common::nonce_hex(0xaa),
+        "ctx",
+        common::rd(0x41),
+        None,
+    );
+    for entry in &mut env.keyset.tls_public_keys {
+        if entry.domain == "llm.kubetee.ai" {
+            entry.spki_sha256 = "sha256:".to_string() + &"00".repeat(32);
+        }
     }
+    let leaf = common::x509_leaf(&common::tls_leaf());
     assert!(
-        kv::verify_tls_possession(&env2, "llm.kubetee.ai", &leaf).is_err(),
-        "wrong TLS SPKI must FAIL possession"
+        kv::verify_spki_pin(&env, "llm.kubetee.ai", &leaf).is_err(),
+        "wrong TLS SPKI must FAIL the pin"
     );
 }
+
+mod common;

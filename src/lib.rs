@@ -1,5 +1,5 @@
 //! Independent, fail-closed AMD SEV-SNP verifier for the KubeTEE TEE
-//! attestation envelope (`kubetee.attestation.v1`).
+//! attestation envelope (`kubetee.attestation.v2`).
 //!
 //! This crate is the reference verifier partners (Chutes, SayGM, gm-miner)
 //! can run to independently confirm a KubeTEE gateway's TEE evidence without
@@ -9,9 +9,12 @@
 //!      `cert_chain`), checked against AMD's root of trust.
 //!   2. **Report signature** — the SNP report's ECDSA P-384/SHA-384 signature
 //!      over `to_bytes()[..0x2a0]`, verified against the VCEK.
-//!   3. **Request binding** — `report_data` == `sha256(jcs(statement)) || 32
-//!      zeros` where `statement` binds the caller nonce + the served keyset
-//!      digest (anti-replay, anti-downgrade).
+//!   3. **Request binding** — `report_data` == `SHA-384(tag ‖ framed(pkix) ‖
+//!      framed(nonce) ‖ framed(context)) ‖ 16 zeros` where the statement binds
+//!      the caller nonce, a per-boot in-guest generated key, and the served
+//!      keyset digest (anti-replay, anti-downgrade). Only
+//!      `kubetee.attestation.v2` is accepted — the legacy v1 binding is hard
+//!      retired and rejected fail-closed.
 //!   4. **Reference measurement match** — the report's `measurement` /
 //!      `host_data` / `report_version` match the signed `.well-known`
 //!      reference (`tee-measurements.json`), or (for TDX backends) the live
@@ -20,9 +23,7 @@
 //!      pin matches the served TLS leaf, and a `key_possession` ECDSA
 //!      P-256/SHA-256 signature over the quote-bound `report_data` verifies
 //!      under the **per-boot in-guest generated** key the v2 statement
-//!      commits (zero-operator trust). For legacy `kubetee.attestation.v1`
-//!      envelopes the TLS-possession proof (leaf-signed nonce) is checked
-//!      instead.
+//!      commits (zero-operator trust).
 //!
 //! Every check fails closed: a mismatch, a malformed field, or an absent
 //! expected value is an error, never a pass.
@@ -35,13 +36,11 @@ pub mod snp;
 
 pub use binding::{
     BindingError, KEY_ATTESTATION_TAG, POSSESSION_ALG, POSSESSION_INPUT, PURPOSE_V2,
-    decode_pkix_pubkey, keyset_digest, normalize_nonce, report_data_legacy,
-    report_data_preimage_v2, report_data_statement, report_data_statement_v2, report_data_v1,
-    report_data_v2, verify_binding, verify_key_possession, verify_spki_pin, verify_tls_possession,
+    decode_pkix_pubkey, keyset_digest, normalize_nonce, report_data_preimage_v2,
+    report_data_statement_v2, report_data_v2, verify_binding, verify_key_possession,
+    verify_spki_pin,
 };
-pub use envelope::{
-    CertEntry, Envelope, KeyPossession, ParseError, SnpReport, TlsPossession, parse_envelope,
-};
+pub use envelope::{CertEntry, Envelope, KeyPossession, ParseError, SnpReport, parse_envelope};
 pub use registry::{
     GENESIS_PREVIOUS, Record, RegistryError, TRANSITION_TAG, content_hash, match_any_active_record,
     match_snp_reference, registry_records, tdx_regs, transition_hash, verify_chain_links,
@@ -117,11 +116,13 @@ pub fn verify(input: &VerifyInput<'_>) -> Verdict {
         Err(e) => fail(&mut lines, format!("amd-chain: {e}")),
     }
 
-    // (3) Request binding.
+    // (3) Request binding (v2 only — legacy v1 is hard retired, fail-closed).
     let keyset_digest = match verify_binding(input.envelope) {
         Ok(d) => {
-            lines
-                .push("PASS request-binding report_data = sha256(statement)||32-zeros".to_string());
+            lines.push(
+                "PASS request-binding report_data = SHA-384(tag||framed(pkix,nonce,context))||16-zeros"
+                    .to_string(),
+            );
             Some(d)
         }
         Err(e) => {
@@ -198,37 +199,30 @@ pub fn verify(input: &VerifyInput<'_>) -> Verdict {
         }
     }
 
-    // (5) Possession + SPKI pin. v2 (quote-bound per-boot key) checks
-    // `key_possession` over the report_data under the statement's key; a
-    // legacy v1 envelope falls back to the TLS-possession proof (leaf-signed
-    // nonce). Both require the keyset to name this connection's leaf key.
+    // (5) Key possession + SPKI pin (v2 only). The quote-bound per-boot key
+    // must produce a `key_possession` ECDSA P-256 signature over the
+    // report_data; the served keyset must name this connection's leaf key.
+    // Legacy v1 envelopes are rejected at step 3 (fail-closed) and never
+    // reach this point.
     if let Some(leaf_der) = input.tls_leaf_der {
         use x509_cert::der::Decode;
         match x509_cert::Certificate::from_der(leaf_der) {
             Ok(leaf) => {
-                if input.envelope.bindings.version == binding::PURPOSE_V2 {
-                    match (
-                        binding::verify_spki_pin(input.envelope, input.tls_domain, &leaf),
-                        binding::verify_key_possession(input.envelope),
-                    ) {
-                        (Ok(()), Ok(())) => lines.push(
-                            "PASS key-possession spki-pin+ecdsa-p256-over-quote-report-data"
-                                .to_string(),
-                        ),
-                        (pin, possession) => {
-                            if let Err(e) = pin {
-                                fail(&mut lines, format!("tls-possession: {e}"));
-                            }
-                            if let Err(e) = possession {
-                                fail(&mut lines, format!("key-possession: {e}"));
-                            }
+                match (
+                    binding::verify_spki_pin(input.envelope, input.tls_domain, &leaf),
+                    binding::verify_key_possession(input.envelope),
+                ) {
+                    (Ok(()), Ok(())) => lines.push(
+                        "PASS key-possession spki-pin+ecdsa-p256-over-quote-report-data"
+                            .to_string(),
+                    ),
+                    (pin, possession) => {
+                        if let Err(e) = pin {
+                            fail(&mut lines, format!("spki-pin: {e}"));
                         }
-                    }
-                } else {
-                    match verify_tls_possession(input.envelope, input.tls_domain, &leaf) {
-                        Ok(()) => lines
-                            .push("PASS tls-possession spki-pin+signature-over-nonce".to_string()),
-                        Err(e) => fail(&mut lines, format!("tls-possession: {e}")),
+                        if let Err(e) = possession {
+                            fail(&mut lines, format!("key-possession: {e}"));
+                        }
                     }
                 }
             }

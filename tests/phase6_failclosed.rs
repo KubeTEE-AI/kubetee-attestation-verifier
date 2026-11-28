@@ -10,11 +10,6 @@
 use kubetee_attestation_verifier as kv;
 
 pub const EVIDENCE_V4: &str = include_str!("fixtures/live_evidence_v4.json");
-
-fn v4_envelope() -> kv::Envelope {
-    kv::parse_envelope(EVIDENCE_V4).expect(".6 evidence parses")
-}
-
 // ---------------------------------------------------------------------------
 // v2 binding — ReportDataForKeyWithContext (frozen vector)
 // ---------------------------------------------------------------------------
@@ -97,10 +92,12 @@ fn v2_zero_length_inputs_reject() {
     assert!(kv::decode_pkix_pubkey("").is_err());
 }
 
-/// Unknown binding version must FAIL CLOSED (no silent v1 fallback).
+/// Unknown binding version must FAIL CLOSED (no silent fallback) — including
+/// the retired legacy v1.
 #[test]
 fn unknown_binding_version_rejects() {
-    let mut env = v4_envelope();
+    let key = common::BootKey::from_seed(0x61);
+    let mut env = common::v2_bound_envelope(&key, &common::nonce_hex(0xaa), "ctx");
     env.bindings.version = "kubetee.attestation.v3".to_string();
     assert!(
         kv::verify_binding(&env).is_err(),
@@ -111,7 +108,14 @@ fn unknown_binding_version_rejects() {
         kv::verify_binding(&env).is_err(),
         "empty version must reject"
     );
+    env.bindings.version = "kubetee.attestation.v1".to_string();
+    assert!(
+        kv::verify_binding(&env).is_err(),
+        "retired legacy v1 must reject"
+    );
 }
+
+mod common;
 
 // ---------------------------------------------------------------------------
 // CVE-shaped fail-closed fixtures
@@ -121,13 +125,14 @@ fn unknown_binding_version_rejects() {
 /// fields are empty must reject, never pass by "nothing to compare".
 #[test]
 fn fixture_missing_expectation_accepts() {
-    let mut env = v4_envelope();
+    let key = common::BootKey::from_seed(0x62);
+    let mut env = common::v2_bound_envelope(&key, &common::nonce_hex(0xaa), "ctx");
     env.bindings.keyset_digest = String::new();
     assert!(
         kv::verify_binding(&env).is_err(),
         "empty keyset_digest expectation must FAIL"
     );
-    let mut env2 = v4_envelope();
+    let mut env2 = common::v2_bound_envelope(&key, &common::nonce_hex(0xaa), "ctx");
     env2.bindings.report_data_statement = String::new();
     assert!(
         kv::verify_binding(&env2).is_err(),
@@ -139,7 +144,8 @@ fn fixture_missing_expectation_accepts() {
 /// quote_report_data must FAIL the consistency check, never skip it.
 #[test]
 fn fixture_zero_length_bypass() {
-    let mut env = v4_envelope();
+    let key = common::BootKey::from_seed(0x63);
+    let mut env = common::v2_bound_envelope(&key, &common::nonce_hex(0xaa), "ctx");
     env.quote_report_data = Some([0u8; 64]);
     assert!(
         kv::verify_binding(&env).is_err(),

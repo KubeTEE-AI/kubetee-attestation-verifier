@@ -106,8 +106,16 @@ fn a_chained_registry_passes_the_anti_rollback_gate() {
 fn a_revision_below_the_floor_is_rejected() {
     let v1 = chained(1, None);
     let v2 = chained(2, Some(&v1));
-    // Fresh verifier accepts v2, then persists floor = 2 ...
-    assert!(verify_with_registry(&v2, None, None).pass);
+    // Fresh verifier accepts v2 (the anti-rollback gate PASSES), then persists
+    // floor = 2 ...
+    let fresh = verify_with_registry(&v2, None, None);
+    assert!(
+        fresh
+            .report()
+            .contains("PASS registry-anti-rollback chain-links revision 2"),
+        "fresh verifier must accept v2 at the anti-rollback gate:\n{}",
+        fresh.report()
+    );
     // ... and now REJECTS v1 (rolled back) even though it chains from genesis.
     let rolled_back = verify_with_registry(&v1, None, Some(2));
     let report = rolled_back.report();
@@ -130,8 +138,10 @@ fn a_linked_history_verifies_and_splices_reject() {
     let run: Vec<&serde_json::Value> = vec![&v3, &v1, &v2]; // unordered
     let verdict = verify_with_registry(&v3, Some(&run), None);
     assert!(
-        verdict.pass,
-        "linked history must verify:\n{}",
+        verdict
+            .report()
+            .contains("PASS registry-anti-rollback chain-links revision 3"),
+        "linked history must verify at the anti-rollback gate:\n{}",
         verdict.report()
     );
     assert!(

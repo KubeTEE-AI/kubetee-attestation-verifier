@@ -1,4 +1,4 @@
-//! Envelope parsing for the `kubetee.attestation.v1` evidence document.
+//! Envelope parsing for the `kubetee.attestation.v2` evidence document.
 //!
 //! The gateway (`/v1/attestation`) serves a JSON envelope with an
 //! `evidence.snp.attestation_report` whose fields are the *parsed* AMD
@@ -184,14 +184,6 @@ fn cert_entry(x: &serde_json::Value) -> Option<CertEntry> {
     Some(CertEntry { cert_type, der })
 }
 
-#[derive(Debug, Clone)]
-pub struct TlsPossession {
-    pub tls_signature: String,
-    pub tls_signature_alg: String,
-    pub tls_signature_input: String,
-    pub tls_cert_sha256: Option<String>,
-}
-
 /// The v2 possession proof (`kubetee.attestation.v2`): an ECDSA P-256/SHA-256
 /// signature over the quote-bound 64-byte `report_data`, under the **per-boot
 /// in-guest generated** key the v2 statement commits (`pkix_pubkey_b64url`).
@@ -216,8 +208,8 @@ pub struct Envelope {
     pub pod: String,
     pub keyset: Keyset,
     pub bindings: Bindings,
-    pub tls_possession: Option<TlsPossession>,
-    /// The v2 quote-bound key-possession proof (absent on v1 envelopes).
+    /// The v2 quote-bound key-possession proof (the ONLY possession proof —
+    /// the legacy v1 `tls_possession` is retired).
     pub key_possession: Option<KeyPossession>,
     /// `evidence.snp.cert_chain` (VCEK/ASK/ARK since gateway .6; empty before).
     pub cert_chain: Vec<CertEntry>,
@@ -478,18 +470,6 @@ pub fn parse_envelope(doc: &str) -> Result<Envelope, ParseError> {
             .to_string(),
     };
 
-    let tls_possession = v.get("tls_possession").and_then(|tp| {
-        Some(TlsPossession {
-            tls_signature: tp.get("tls_signature")?.as_str()?.to_string(),
-            tls_signature_alg: tp.get("tls_signature_alg")?.as_str()?.to_string(),
-            tls_signature_input: tp.get("tls_signature_input")?.as_str()?.to_string(),
-            tls_cert_sha256: tp
-                .get("tls_cert_sha256")
-                .and_then(|x| x.as_str())
-                .map(str::to_string),
-        })
-    });
-
     // Present-but-malformed must FAIL the parse (fail closed), never silently
     // drop to `None` and skip the possession check (CVE-2026-92702 class).
     let key_possession = match v.get("key_possession") {
@@ -601,7 +581,6 @@ pub fn parse_envelope(doc: &str) -> Result<Envelope, ParseError> {
             .to_string(),
         keyset,
         bindings,
-        tls_possession,
         key_possession,
         cert_chain,
         snp,

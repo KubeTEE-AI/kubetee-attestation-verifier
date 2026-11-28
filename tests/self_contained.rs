@@ -49,7 +49,11 @@ fn v4_self_contained_chain_and_signature_verify() {
     kv::verify_snp(&env.snp, &ark, &ask, &vcek).expect("explicit PEMs verify too");
 }
 
-/// `verify()` with NO PEM overrides uses the envelope's cert_chain end-to-end.
+/// `verify()` with NO PEM overrides uses the envelope's cert_chain end-to-end
+/// (the self-contained chain path). The `.6` capture's binding is the retired
+/// v1 form and is hard rejected — pinned in `verify_live.rs` — so this asserts
+/// the self-contained **AMD chain + report signature** and the reference match
+/// pass, which is what the cert_chain fix delivered.
 #[test]
 fn v4_verify_passes_self_contained() {
     let env = v4_envelope();
@@ -69,10 +73,14 @@ fn v4_verify_passes_self_contained() {
         now_iso: None,
     };
     let verdict = kv::verify(&input);
+    let report = verdict.report();
     assert!(
-        verdict.pass,
-        "self-contained verify must PASS:\n{}",
-        verdict.report()
+        report.contains("PASS amd-chain ark->ask->vcek + report-signature"),
+        "self-contained chain + signature must PASS (no KDS):\n{report}"
+    );
+    assert!(
+        report.contains("PASS reference-measurement"),
+        "reference measurement must PASS:\n{report}"
     );
 }
 
@@ -87,12 +95,17 @@ fn v4_report_matches_signed_v4_reference() {
         .expect("v4 reference signature verifies");
 }
 
-/// The request binding (nonce + keyset digest -> report_data) holds on the .6 capture.
+/// The request binding (nonce + keyset digest -> report_data) holds on a
+/// synthetic v2 envelope. (The raw `.6` capture is a legacy v1 envelope and is
+/// hard rejected — pinned in `verify_live.rs`.)
 #[test]
-fn v4_binding_verifies() {
-    let env = v4_envelope();
-    kv::verify_binding(&env).expect(".6 binding verifies");
+fn v2_binding_verifies() {
+    let key = common::BootKey::from_seed(0x51);
+    let env = common::v2_bound_envelope(&key, &common::nonce_hex(0xaa), "ctx");
+    kv::verify_binding(&env).expect("v2 binding verifies");
 }
+
+mod common;
 
 // ---- FAIL-CLOSED vectors ------------------------------------------------------
 
@@ -134,10 +147,11 @@ fn v4_tampered_report_fails_signature() {
     );
 }
 
-/// A tampered nonce must fail the request binding.
+/// A tampered nonce must fail the request binding (on a v2 envelope).
 #[test]
-fn v4_tampered_nonce_fails_binding() {
-    let mut env = v4_envelope();
+fn v2_tampered_nonce_fails_binding() {
+    let key = common::BootKey::from_seed(0x52);
+    let mut env = common::v2_bound_envelope(&key, &common::nonce_hex(0xaa), "ctx");
     env.nonce = "ff".repeat(32);
     assert!(
         kv::verify_binding(&env).is_err(),
@@ -147,8 +161,9 @@ fn v4_tampered_nonce_fails_binding() {
 
 /// A tampered keyset digest must fail the request binding (anti-downgrade).
 #[test]
-fn v4_tampered_keyset_digest_fails_binding() {
-    let mut env = v4_envelope();
+fn v2_tampered_keyset_digest_fails_binding() {
+    let key = common::BootKey::from_seed(0x53);
+    let mut env = common::v2_bound_envelope(&key, &common::nonce_hex(0xaa), "ctx");
     env.bindings.keyset_digest = "sha256:".to_string() + &"0".repeat(64);
     assert!(
         kv::verify_binding(&env).is_err(),
