@@ -2,12 +2,14 @@
 //!
 //! Fail-closed. The report signature is checked over the exact 672-byte signed
 //! body (`to_bytes()[..0x2a0]`) using the VCEK's P-384 key; the ARK→ASK→VCEK
-//! chain is checked against AMD's KDS root of trust. We reuse `sev`'s
+//! chain is verified **and the ARK pinned to `sev`'s built-in AMD root of
+//! trust** (so a self-consistent but forged chain is rejected). We reuse `sev`'s
 //! `crypto_nossl` verifier for the byte-exact reconstruction + ECDSA — the
 //! crate is the reference implementation and doing this by hand is the known
 //! footgun (`virtee/sev` maintainers flag `to_bytes` as tricky).
 
 use crate::envelope::{self, SnpReport, Tcb};
+use sev::certs::snp::builtin;
 use sev::certs::snp::{Certificate, Chain, Verifiable};
 use sev::firmware::guest::{AttestationReport, Version};
 use sev::firmware::host::TcbVersion;
@@ -22,12 +24,48 @@ pub enum SnpError {
     SignatureMismatch,
     #[error("certificate chain does NOT verify (ARK->ASK->VCEK)")]
     ChainInvalid,
+    #[error("certificate chain is NOT anchored to a known AMD root: {0}")]
+    UntrustedRoot(String),
     #[error("sev: {0}")]
     Sev(String),
 }
 
 fn to_tcb(t: Tcb) -> TcbVersion {
     TcbVersion::new(t.fmc, t.bootloader, t.tee, t.snp, t.microcode)
+}
+
+/// Pin the served ARK to a built-in AMD root of trust (Milan/Genoa/Turin).
+///
+/// `sev`'s `Chain::verify` only proves the chain is internally self-consistent
+/// (ARK self-signed + ARK signs ASK + ASK signs VCEK). Without this pin, an
+/// adversary who controls the gateway could serve a **forged self-signed
+/// ARK->ASK->VCEK** and a fabricated report, and it would verify. Anchoring the
+/// ARK to `sev`'s built-in AMD root certificates (the single source of truth,
+/// so the anchors cannot drift between crates) makes the chain genuinely
+/// traceable to AMD. Returns the matched generation name.
+fn pin_ark(ark: &Certificate) -> Result<&'static str, SnpError> {
+    let served = ark
+        .to_der()
+        .map_err(|e| SnpError::Cert(format!("served ARK DER: {e}")))?;
+    let roots: [(&str, &[u8]); 3] = [
+        ("Milan", builtin::milan::ARK),
+        ("Genoa", builtin::genoa::ARK),
+        ("Turin", builtin::turin::ARK),
+    ];
+    for (name, pem) in roots {
+        let root = Certificate::from_pem(pem)
+            .map_err(|e| SnpError::Cert(format!("builtin {name} ARK: {e}")))?;
+        let root_der = root
+            .to_der()
+            .map_err(|e| SnpError::Cert(format!("builtin {name} ARK DER: {e}")))?;
+        if served == root_der {
+            return Ok(name);
+        }
+    }
+    Err(SnpError::UntrustedRoot(
+        "ARK is not a known AMD root (Milan/Genoa/Turin) — refusing to trust a foreign root"
+            .to_string(),
+    ))
 }
 
 fn to_version(v: envelope::Version3) -> Version {
@@ -95,8 +133,11 @@ pub fn build_chain(ark_pem: &str, ask_pem: &str, vcek_pem: &str) -> Result<Chain
     Ok((ask, ark, vcek).into())
 }
 
-/// Verify the AMD chain (ARK self-signed + ARK signs ASK + ASK signs VCEK).
+/// Verify the AMD chain (ARK self-signed + ARK signs ASK + ASK signs VCEK),
+/// and **pin the ARK to a known AMD root of trust** (see [`pin_ark`]) — the
+/// self-consistency `sev` checks is not enough on its own.
 pub fn verify_chain(chain: &Chain) -> Result<(), SnpError> {
+    pin_ark(&chain.ca.ark)?;
     chain.verify().map_err(|_| SnpError::ChainInvalid)?;
     Ok(())
 }

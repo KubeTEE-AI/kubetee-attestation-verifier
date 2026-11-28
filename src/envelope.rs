@@ -1,4 +1,4 @@
-//! Envelope parsing for the `kubetee.attestation.v1` evidence document.
+//! Envelope parsing for the `kubetee.attestation.v2` evidence document.
 //!
 //! The gateway (`/v1/attestation`) serves a JSON envelope with an
 //! `evidence.snp.attestation_report` whose fields are the *parsed* AMD
@@ -7,7 +7,7 @@
 //! KubeTEE side, kept byte-consistent with
 //! `litellm/tools/kubetee-litellm-overlay/kubetee_attestation.py`.
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{Engine, engine::general_purpose::URL_SAFE, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, thiserror::Error)]
@@ -184,12 +184,19 @@ fn cert_entry(x: &serde_json::Value) -> Option<CertEntry> {
     Some(CertEntry { cert_type, der })
 }
 
+/// The v2 possession proof (`kubetee.attestation.v2`): an ECDSA P-256/SHA-256
+/// signature over the quote-bound 64-byte `report_data`, under the **per-boot
+/// in-guest generated** key the v2 statement commits (`pkix_pubkey_b64url`).
+/// This replaces `tls_possession` in v2 — the operator-custodied serving key
+/// plays no part in it.
 #[derive(Debug, Clone)]
-pub struct TlsPossession {
-    pub tls_signature: String,
-    pub tls_signature_alg: String,
-    pub tls_signature_input: String,
-    pub tls_cert_sha256: Option<String>,
+pub struct KeyPossession {
+    /// The input class the signature covers: must be `quote_report_data`.
+    pub input: String,
+    /// The signature algorithm: must be `ecdsa-secp256r1-sha256`.
+    pub alg: String,
+    /// The signature over the raw 64 report-data bytes (standard base64).
+    pub signature_b64: String,
 }
 
 #[derive(Debug, Clone)]
@@ -201,7 +208,9 @@ pub struct Envelope {
     pub pod: String,
     pub keyset: Keyset,
     pub bindings: Bindings,
-    pub tls_possession: Option<TlsPossession>,
+    /// The v2 quote-bound key-possession proof (the ONLY possession proof —
+    /// the legacy v1 `tls_possession` is retired).
+    pub key_possession: Option<KeyPossession>,
     /// `evidence.snp.cert_chain` (VCEK/ASK/ARK since gateway .6; empty before).
     pub cert_chain: Vec<CertEntry>,
     pub snp: SnpReport,
@@ -461,17 +470,28 @@ pub fn parse_envelope(doc: &str) -> Result<Envelope, ParseError> {
             .to_string(),
     };
 
-    let tls_possession = v.get("tls_possession").and_then(|tp| {
-        Some(TlsPossession {
-            tls_signature: tp.get("tls_signature")?.as_str()?.to_string(),
-            tls_signature_alg: tp.get("tls_signature_alg")?.as_str()?.to_string(),
-            tls_signature_input: tp.get("tls_signature_input")?.as_str()?.to_string(),
-            tls_cert_sha256: tp
-                .get("tls_cert_sha256")
+    // Present-but-malformed must FAIL the parse (fail closed), never silently
+    // drop to `None` and skip the possession check (CVE-2026-92702 class).
+    let key_possession = match v.get("key_possession") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(kp) => Some(KeyPossession {
+            input: kp
+                .get("input")
                 .and_then(|x| x.as_str())
-                .map(str::to_string),
-        })
-    });
+                .ok_or(ParseError::Missing("key_possession.input"))?
+                .to_string(),
+            alg: kp
+                .get("alg")
+                .and_then(|x| x.as_str())
+                .ok_or(ParseError::Missing("key_possession.alg"))?
+                .to_string(),
+            signature_b64: kp
+                .get("signature_b64")
+                .and_then(|x| x.as_str())
+                .ok_or(ParseError::Missing("key_possession.signature_b64"))?
+                .to_string(),
+        }),
+    };
 
     let cert_chain: Vec<CertEntry> = snp_node
         .get("cert_chain")
@@ -479,16 +499,43 @@ pub fn parse_envelope(doc: &str) -> Result<Envelope, ParseError> {
         .map(|arr| arr.iter().filter_map(cert_entry).collect())
         .unwrap_or_default();
 
-    let quote_report_data = v
-        .get("evidence")
-        .and_then(|e| e.get("quote_report_data"))
-        .and_then(|q| q.as_str())
-        .and_then(|b64| {
-            let bytes = URL_SAFE_NO_PAD.decode(b64).ok().filter(|b| b.len() == 64)?;
-            let mut out = [0u8; 64];
-            out.copy_from_slice(&bytes);
-            Some(out)
-        });
+    let quote_report_data = {
+        let node = v.get("evidence").and_then(|e| e.get("quote_report_data"));
+        match node {
+            None | Some(serde_json::Value::Null) => None,
+            Some(q) => {
+                // Present-but-malformed must FAIL the parse (fail closed), not
+                // silently drop to `None` and skip the consistency check
+                // (CVE-2026-92702 zero-length-skips-check class). Accept
+                // padded or unpadded base64url; require exactly 64 bytes.
+                let b64 = q.as_str().ok_or(ParseError::Field {
+                    field: "quote_report_data",
+                    why: "not a base64 string".to_string(),
+                })?;
+                // Line-wrapped base64 appears in live captures (embedded JSON
+                // pretty-printers wrap the long value) — strip interior
+                // whitespace, then accept padded/unpadded base64url or
+                // standard base64. Require exactly 64 bytes.
+                let cleaned: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+                let bytes = URL_SAFE_NO_PAD
+                    .decode(cleaned.trim_end_matches('='))
+                    .or_else(|_| URL_SAFE.decode(&cleaned))
+                    .or_else(|_| {
+                        use base64::engine::general_purpose::STANDARD;
+                        STANDARD.decode(&cleaned)
+                    })
+                    .ok()
+                    .filter(|b| b.len() == 64)
+                    .ok_or(ParseError::Field {
+                        field: "quote_report_data",
+                        why: "must decode to exactly 64 bytes".to_string(),
+                    })?;
+                let mut out = [0u8; 64];
+                out.copy_from_slice(&bytes);
+                Some(out)
+            }
+        }
+    };
 
     let evidence_node = v.get("evidence");
     let tdx_evidence = evidence_node
@@ -534,7 +581,7 @@ pub fn parse_envelope(doc: &str) -> Result<Envelope, ParseError> {
             .to_string(),
         keyset,
         bindings,
-        tls_possession,
+        key_possession,
         cert_chain,
         snp,
         quote_report_data,
